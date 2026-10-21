@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""tb-touch-gestures: touchscreen + pen gestures for games under gamescope (TB710FU).
+
+gamescope's own touch modes are "touch = one mouse button" or raw passthrough, so games get
+no right click, no drag on some titles, no camera rotation, no zoom. While a game has focus
+(and the saved touch mode is not 4 = native), this daemon grabs the touchscreen and the pen
+and turns them into mouse input: the cursor is placed with XTEST (gamescope maps XTEST motion
+onto the focused window, in window coordinates), buttons, wheel and the motion while the right or
+middle button is held come from a virtual relative mouse (uinput) -- games that rotate the camera
+with the mouse (Unity, raw input) only react to real relative motion:
+
+  one finger   tap = left click, press and move = left drag,
+               hold still 0.45 s = right button (release = right click, move = right drag)
+  two fingers  tap = right click, move together = right drag (rotate the camera),
+               pinch = mouse wheel (zoom)
+  pen          hover = move, tip = left, tip with side button = right, second button = middle
+
+Steam's own UI keeps native touch (swipe scrolling); the pen is turned into a one-finger
+touchscreen there (gamescope ignores tablet tools). Runs as the session user.
+Env: TB_TWO_FINGER_BUTTON=3 (right) | 2 (middle), TB_LONG_PRESS=0.45
+"""
+import ctypes as C
+import fcntl, math, os, re, select, struct, time
+
+TOUCH_NAME = os.environ.get("TB_TOUCH_NAME", "NVTCapacitiveTouchScreen")   # override for testing
+PEN_NAME = "NVTCapacitivePen"
+PANEL_W, PANEL_H, UNIT = 3200, 2000, 10          # touch/pen units are 1/10 panel pixel
+LONG = float(os.environ.get("TB_LONG_PRESS", "0.45"))
+TWO_BTN = int(os.environ.get("TB_TWO_FINGER_BUTTON", "3"))
+ROT_GAIN = float(os.environ.get("TB_ROTATE_GAIN", "1.0"))   # mouse counts per window pixel
+TAP_MOVE, LOCK_MOVE, PINCH_STEP = 40, 30, 70      # panel pixels
+MODE_FILE = os.path.expanduser("~/.config/tb710fu/touch-mode")
+STEAM_APP = 769
+
+EV = struct.Struct("qqHHi")
+EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+ABS_X, ABS_Y = 0, 1
+EV_REL, REL_X, REL_Y, REL_WHEEL, REL_WHEEL_HI_RES = 2, 0, 1, 8, 11
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+ABS_MT_SLOT, ABS_MT_X, ABS_MT_Y, ABS_MT_ID = 0x2f, 0x35, 0x36, 0x39
+BTN_TOUCH, BTN_STYLUS, BTN_STYLUS2, BTN_TOOL_PEN = 0x14a, 0x14b, 0x14c, 0x140
+EVIOCGRAB = 0x40044590
+
+
+DEBUG = bool(os.environ.get("TB_GESTURE_DEBUG"))
+
+
+def log(*a):
+    print("tb-touch-gestures:", *a, flush=True)
+
+
+def dbg(*a):
+    if DEBUG:
+        log(*a)
+
+
+def find_dev(name):
+    try:
+        text = open("/proc/bus/input/devices").read()
+    except OSError:
+        return None
+    for block in text.split("\n\n"):
+        if f'Name="{name}"' in block:
+            m = re.search(r"\bevent(\d+)\b", block)
+            if m:
+                return f"/dev/input/event{m.group(1)}"
+    return None
+
+
+# ---------------------------------------------------------------- X11 / XTEST
+X = C.CDLL("libX11.so.6")
+XT = C.CDLL("libXtst.so.6")
+X.XOpenDisplay.restype = C.c_void_p
+X.XOpenDisplay.argtypes = [C.c_char_p]
+X.XDefaultRootWindow.restype = C.c_ulong
+X.XDefaultRootWindow.argtypes = [C.c_void_p]
+X.XInternAtom.restype = C.c_ulong
+X.XInternAtom.argtypes = [C.c_void_p, C.c_char_p, C.c_int]
+X.XGetWindowProperty.argtypes = [C.c_void_p, C.c_ulong, C.c_ulong, C.c_long, C.c_long, C.c_int, C.c_ulong,
+                                 C.POINTER(C.c_ulong), C.POINTER(C.c_int), C.POINTER(C.c_ulong),
+                                 C.POINTER(C.c_ulong), C.POINTER(C.c_void_p)]
+X.XFree.argtypes = [C.c_void_p]
+X.XFlush.argtypes = [C.c_void_p]
+X.XSync.argtypes = [C.c_void_p, C.c_int]
+X.XGetGeometry.argtypes = [C.c_void_p, C.c_ulong, C.POINTER(C.c_ulong), C.POINTER(C.c_int), C.POINTER(C.c_int),
+                           C.POINTER(C.c_uint), C.POINTER(C.c_uint), C.POINTER(C.c_uint), C.POINTER(C.c_uint)]
+XT.XTestFakeMotionEvent.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_ulong]
+XT.XTestFakeButtonEvent.argtypes = [C.c_void_p, C.c_uint, C.c_int, C.c_ulong]
+ERRH = C.CFUNCTYPE(C.c_int, C.c_void_p, C.c_void_p)(lambda d, e: 0)   # ignore BadWindow etc.
+X.XSetErrorHandler(ERRH)
+
+
+class Disp:
+    def __init__(self, name):
+        self.name = name
+        self.d = X.XOpenDisplay(name.encode())
+        if not self.d:
+            raise OSError("cannot open display " + name)
+        self.root = X.XDefaultRootWindow(self.d)
+
+    def card(self, atom):
+        a = X.XInternAtom(self.d, atom.encode(), 0)
+        t, f, n, rest, data = C.c_ulong(), C.c_int(), C.c_ulong(), C.c_ulong(), C.c_void_p()
+        if X.XGetWindowProperty(self.d, self.root, a, 0, 1, 0, 0, C.byref(t), C.byref(f), C.byref(n),
+                                C.byref(rest), C.byref(data)) != 0 or not data.value:
+            return None
+        v = C.cast(data, C.POINTER(C.c_ulong))[0] if n.value else None
+        X.XFree(data)
+        return v
+
+    def size(self, win):
+        r, x, y, w, h, b, dp = C.c_ulong(), C.c_int(), C.c_int(), C.c_uint(), C.c_uint(), C.c_uint(), C.c_uint()
+        if not X.XGetGeometry(self.d, win, C.byref(r), C.byref(x), C.byref(y), C.byref(w), C.byref(h),
+                              C.byref(b), C.byref(dp)):
+            return None
+        return w.value, h.value
+
+
+class Mouse:
+    """Virtual relative mouse: buttons, wheel, relative motion."""
+
+    def __init__(self):
+        u = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(u, 0x40045564, EV_KEY)
+        fcntl.ioctl(u, 0x40045564, EV_REL)
+        for k in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE):
+            fcntl.ioctl(u, 0x40045565, k)
+        for r in (REL_X, REL_Y, REL_WHEEL, REL_WHEEL_HI_RES):   # gamescope needs the hi-res axis
+            fcntl.ioctl(u, 0x40045566, r)
+        fcntl.ioctl(u, 0x405c5503, struct.pack("HHHH80sI", 0x03, 0x17ef, 0x6180, 1, b"TB710FU touch mouse", 0))
+        fcntl.ioctl(u, 0x5501)
+        self.u = u
+
+    def emit(self, evs):
+        os.write(self.u, b"".join(EV.pack(0, 0, t, c, v) for t, c, v in evs) + EV.pack(0, 0, EV_SYN, 0, 0))
+
+
+BTN = {1: BTN_LEFT, 2: BTN_MIDDLE, 3: BTN_RIGHT}
+
+
+class Game:
+    """Mouse output for the focused game window."""
+
+    def __init__(self, disp, win, w, h, mouse):
+        self.disp, self.win, self.w, self.h, self.mouse = disp, win, w, h, mouse
+        # gamescope scales the focused window uniformly to fit the panel, but never more than
+        # --max-scale (2 in the SteamOS session), and centres it
+        self.s = min(PANEL_W / w, PANEL_H / h, max_scale())
+        self.ox, self.oy = (PANEL_W - w * self.s) / 2, (PANEL_H - h * self.s) / 2
+        self.last = None            # last XTEST position (window px)
+        self.pos = None             # last panel position seen
+        self.acc = [0.0, 0.0]       # sub-count remainder of relative motion
+        self.down = set()
+
+    def move(self, px, py):
+        if self.down & {2, 3} and self.pos:
+            # right/middle held (camera rotation): relative motion only
+            self.acc[0] += (px - self.pos[0]) / self.s * ROT_GAIN
+            self.acc[1] += (py - self.pos[1]) / self.s * ROT_GAIN
+            dx, dy = int(self.acc[0]), int(self.acc[1])
+            if dx or dy:
+                self.acc[0] -= dx
+                self.acc[1] -= dy
+                self.mouse.emit([(EV_REL, REL_X, dx), (EV_REL, REL_Y, dy)])
+        else:
+            x = int(min(max((px - self.ox) / self.s, 0), self.w - 1))
+            y = int(min(max((py - self.oy) / self.s, 0), self.h - 1))
+            if (x, y) != self.last:
+                XT.XTestFakeMotionEvent(self.disp.d, -1, x, y, 0)
+                X.XFlush(self.disp.d)
+                self.last = (x, y)
+        self.pos = (px, py)
+
+    def button(self, b, press):
+        if press and b in self.down or not press and b not in self.down:
+            return
+        (self.down.add if press else self.down.discard)(b)
+        self.acc = [0.0, 0.0]
+        if not press and b in (2, 3):
+            self.last = None    # relative motion may have moved the cursor: re-place it next time
+        self.mouse.emit([(EV_KEY, BTN[b], 1 if press else 0)])
+
+    def click(self, b):
+        self.button(b, True)
+        time.sleep(0.03)
+        self.button(b, False)
+
+    def wheel(self, steps):
+        for _ in range(abs(steps)):
+            v = 1 if steps > 0 else -1
+            self.mouse.emit([(EV_REL, REL_WHEEL, v), (EV_REL, REL_WHEEL_HI_RES, 120 * v)])
+            time.sleep(0.01)
+
+    def release_all(self):
+        for b in list(self.down):
+            self.button(b, False)
+        self.last = None    # gamescope may have moved the cursor meanwhile
+
+
+# ---------------------------------------------------------------- pen -> touchscreen (Steam UI)
+class PenTouch:
+    def __init__(self):
+        u = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(u, 0x40045564, EV_KEY)
+        fcntl.ioctl(u, 0x40045564, EV_ABS)
+        fcntl.ioctl(u, 0x40045565, BTN_TOUCH)
+        fcntl.ioctl(u, 0x4004556e, 1)                     # INPUT_PROP_DIRECT
+        for code, mx in ((ABS_X, 32000), (ABS_Y, 20000), (ABS_MT_X, 32000), (ABS_MT_Y, 20000),
+                         (ABS_MT_SLOT, 0), (ABS_MT_ID, 65535)):
+            fcntl.ioctl(u, 0x40045567, code)
+            fcntl.ioctl(u, 0x401c5504, struct.pack("HH6i", code, 0, 0, 0, mx, 0, 0, 0))
+        fcntl.ioctl(u, 0x405c5503, struct.pack("HHHH80sI", 0x06, 0x17ef, 0x617f, 1, b"TB710FU Pen (touch)", 0))
+        fcntl.ioctl(u, 0x5501)
+        self.u, self.tid, self.is_down = u, 0, False
+
+    def emit(self, evs):
+        os.write(self.u, b"".join(EV.pack(0, 0, t, c, v) for t, c, v in evs) + EV.pack(0, 0, EV_SYN, 0, 0))
+
+    def frame(self, x, y, down):
+        if down and not self.is_down:
+            self.tid = (self.tid + 1) & 0xffff
+            self.emit([(EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_ID, self.tid), (EV_ABS, ABS_MT_X, x),
+                       (EV_ABS, ABS_MT_Y, y), (EV_KEY, BTN_TOUCH, 1), (EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y)])
+        elif down:
+            self.emit([(EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_X, x), (EV_ABS, ABS_MT_Y, y),
+                       (EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y)])
+        elif self.is_down:
+            self.emit([(EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_ID, -1), (EV_KEY, BTN_TOUCH, 0)])
+        self.is_down = down
+
+
+# ---------------------------------------------------------------- gestures
+def dist(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+class Gestures:
+    IDLE, PEND, LEFT, RIGHT, TWO, WAIT = range(6)
+
+    def __init__(self):
+        self.g = None
+        self.reset()
+
+    def reset(self):
+        if self.g:
+            self.g.release_all()
+        self.state, self.p0, self.t0 = self.IDLE, None, 0
+        self.lock, self.c0, self.d0, self.dl = None, None, 0, 0
+
+    def touch_frame(self, pts):
+        """pts: list of (x, y) in panel pixels, current contacts in slot order."""
+        g, n, now = self.g, len(pts), time.monotonic()
+        if g is None:
+            return
+        s = self.state
+        if s == self.IDLE:
+            if n == 1:
+                self.state, self.p0, self.t0 = self.PEND, pts[0], now
+                g.move(*pts[0])
+            elif n >= 2:
+                self.enter_two(pts)
+        elif s == self.PEND:
+            if n == 0:
+                g.click(1)
+                self.state = self.IDLE
+            elif n >= 2:
+                self.enter_two(pts)
+            elif dist(pts[0], self.p0) > TAP_MOVE:
+                g.move(*self.p0)
+                g.button(1, True)
+                g.move(*pts[0])
+                self.state = self.LEFT
+        elif s in (self.LEFT, self.RIGHT):
+            b = 1 if s == self.LEFT else 3
+            if n == 1:
+                g.move(*pts[0])
+            else:
+                g.button(b, False)
+                self.state = self.IDLE if n == 0 else self.WAIT
+        elif s == self.TWO:
+            if n < 2:
+                g.release_all()
+                if self.lock is None and now - self.t0 < 0.35:
+                    g.move(*self.c0)                     # two-finger tap: right click
+                    g.click(3)
+                    dbg("two-finger tap: right click")
+                self.state = self.IDLE if n == 0 else self.WAIT
+            else:
+                self.two_move(pts)
+        elif s == self.WAIT and n == 0:
+            self.state = self.IDLE
+
+    def tick(self):
+        if self.g and self.state == self.PEND and time.monotonic() - self.t0 >= LONG:
+            self.g.move(*self.p0)
+            self.g.button(3, True)                       # long press: right button
+            dbg("long press: right")
+            self.state = self.RIGHT
+
+    def enter_two(self, pts):
+        self.g.release_all()
+        a, b = pts[0], pts[1]
+        self.state, self.lock, self.t0 = self.TWO, None, time.monotonic()
+        self.c0 = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+        self.d0 = self.dl = dist(a, b)
+
+    def two_move(self, pts):
+        a, b = pts[0], pts[1]
+        c, d = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2), dist(a, b)
+        if self.lock is None:
+            dd, dc = abs(d - self.d0), dist(c, self.c0)
+            if dd > LOCK_MOVE and dd > dc:
+                self.lock = "zoom"
+                dbg("two fingers: zoom")
+            elif dc > LOCK_MOVE:
+                self.lock = "pan"
+                dbg("two fingers: pan (button %d)" % TWO_BTN)
+                self.g.move(*self.c0)
+                self.g.button(TWO_BTN, True)
+        if self.lock == "pan":
+            self.g.move(*c)
+        elif self.lock == "zoom":
+            steps = int((d - self.dl) / PINCH_STEP)
+            if steps:
+                self.g.move(*c)
+                self.g.wheel(steps)                      # spread = wheel up = zoom in
+                dbg("wheel", steps)
+                self.dl += steps * PINCH_STEP
+
+    def pen_frame(self, x, y, prox, tip, b1, b2):
+        g = self.g
+        if g is None:
+            return
+        if prox or tip:
+            g.move(x, y)
+        want = 3 if b1 else 2 if b2 else 1
+        for b in (1, 2, 3):
+            g.button(b, tip and b == want)
+
+
+# ---------------------------------------------------------------- main loop
+class Dev:
+    def __init__(self, name):
+        self.name, self.path, self.fd, self.grabbed = name, None, None, False
+
+    def ensure(self):
+        if self.fd is not None:
+            return True
+        p = find_dev(self.name)
+        if not p:
+            return False
+        try:
+            self.fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            return False
+        self.path, self.grabbed = p, False
+        log("opened", self.name, p)
+        return True
+
+    def grab(self, on):
+        if self.fd is None or on == self.grabbed:
+            return
+        try:
+            fcntl.ioctl(self.fd, EVIOCGRAB, 1 if on else 0)
+            self.grabbed = on
+        except OSError as e:
+            log("grab", self.name, on, e)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+        self.fd, self.grabbed = None, False
+
+
+def max_scale():
+    try:
+        for p in os.listdir("/proc"):
+            if p.isdigit():
+                try:
+                    a = open(f"/proc/{p}/cmdline", "rb").read().split(b"\0")
+                except OSError:
+                    continue
+                if a and a[0].endswith(b"gamescope") and b"--max-scale" in a:
+                    return float(a[a.index(b"--max-scale") + 1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 1e9
+
+
+def saved_mode():
+    try:
+        return int(open(MODE_FILE).read().strip() or 1)
+    except (OSError, ValueError):
+        return 1
+
+
+def main():
+    while True:
+        try:
+            ui = Disp(":0")
+            break
+        except OSError:
+            time.sleep(2)
+    disps = {":0": ui}
+    touch, pen = Dev(TOUCH_NAME), Dev(PEN_NAME)
+    pentouch = PenTouch()
+    mouse = Mouse()
+    gest = Gestures()
+    slots, cur = {}, 0
+    pstate = {"x": 0, "y": 0, "prox": False, "tip": False, "b1": False, "b2": False}
+    last_poll, game_key = 0, None
+
+    while True:
+        now = time.monotonic()
+        if now - last_poll > 0.3:
+            last_poll = now
+            touch.ensure()
+            pen.ensure()
+            pen.grab(True)
+            app = ui.card("GAMESCOPE_FOCUSED_APP")
+            win = ui.card("GAMESCOPE_FOCUSED_WINDOW")
+            in_game = bool(app) and app != STEAM_APP and saved_mode() != 4 and bool(win)
+            target = None
+            if in_game:
+                for name in (":1", ":0", ":2"):
+                    if name not in disps:                # one connection per display, kept open
+                        try:
+                            disps[name] = Disp(name)
+                        except OSError:
+                            continue
+                    sz = disps[name].size(win)
+                    if sz and sz[0] > 1 and sz[1] > 1:
+                        target = (name, win, sz)
+                        break
+            key = target and (target[0], target[1], target[2])
+            if key != game_key:
+                gest.reset()
+                pentouch.frame(0, 0, False)
+                gest.g = Game(disps[target[0]], target[1], *target[2], mouse) if target else None
+                game_key = key
+                log("game" if target else "steam ui", target or "")
+            # only switch the grab with no finger on the glass: grabbing mid-touch leaves gamescope
+            # with a contact that never lifts (its pointer button then stays pressed)
+            if not slots:
+                touch.grab(gest.g is not None)
+
+        fds = [d.fd for d in (touch, pen) if d.fd is not None]
+        r, _, _ = select.select(fds, [], [], 0.05)
+        gest.tick()
+        for dev in (touch, pen):
+            if dev.fd is None or dev.fd not in r:
+                continue
+            try:
+                data = os.read(dev.fd, EV.size * 64)
+            except OSError:
+                log("lost", dev.name)
+                dev.close()
+                continue
+            for i in range(0, len(data) - EV.size + 1, EV.size):
+                _, _, t, c, v = EV.unpack_from(data, i)
+                if dev is touch:
+                    if t == EV_ABS and c == ABS_MT_SLOT:
+                        cur = v
+                    elif t == EV_ABS and c == ABS_MT_ID:
+                        if v < 0:
+                            slots.pop(cur, None)
+                        else:
+                            slots[cur] = list(slots.get(cur, (0, 0)))
+                    elif t == EV_ABS and c in (ABS_MT_X, ABS_MT_Y) and cur in slots:
+                        slots[cur][0 if c == ABS_MT_X else 1] = v / UNIT
+                    elif t == EV_SYN and c == 0 and touch.grabbed:
+                        gest.touch_frame([tuple(slots[k]) for k in sorted(slots)])
+                else:
+                    if t == EV_ABS and c == ABS_X:
+                        pstate["x"] = v
+                    elif t == EV_ABS and c == ABS_Y:
+                        pstate["y"] = v
+                    elif t == EV_KEY and c == BTN_TOOL_PEN:
+                        pstate["prox"] = bool(v)
+                    elif t == EV_KEY and c == BTN_TOUCH:
+                        pstate["tip"] = bool(v)
+                    elif t == EV_KEY and c == BTN_STYLUS:
+                        pstate["b1"] = bool(v)
+                    elif t == EV_KEY and c == BTN_STYLUS2:
+                        pstate["b2"] = bool(v)
+                    elif t == EV_SYN and c == 0:
+                        if gest.g is not None:
+                            gest.pen_frame(pstate["x"] / UNIT, pstate["y"] / UNIT, pstate["prox"],
+                                           pstate["tip"], pstate["b1"], pstate["b2"])
+                        else:
+                            pentouch.frame(pstate["x"], pstate["y"], pstate["tip"])
+
+
+if __name__ == "__main__":
+    main()

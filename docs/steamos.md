@@ -58,20 +58,39 @@
 - `57-tb710fu-noinput.conf`：禁用 pro-audio 的输入节点。麦克风通路没接，那个节点会让 WirePlumber 启动时卡在加载模块上
   （卡住时 `systemctl restart` 也会挂，只能 `kill -9`）。
 
-## 触摸
+## 触摸与手写笔
 
-gamescope 的触摸模式：`1` = 触摸当作鼠标左键（Proton/Windows 游戏能点），`4` = 原生触摸（Steam 界面能滑动）。
-- `tb-touch-auto`（用户服务）：监听 Xwayland `:0` 根窗口的 `GAMESCOPE_FOCUSED_APP`。
-  Steam 界面（appid 769）或没有焦点时用 4，进游戏时用保存的模式（默认 1）。
-- `tb-touch-mode 1|4`：设置并保存"游戏内"模式；`steamos/tools/add_shortcuts.py` 往 Steam 库里加两个快捷方式
-  "触摸：点击模式 / 原生模式"（直接改二进制 `shortcuts.vdf`，先停 Steam）。
-- `gamescope-session` 补丁：启动时的 `--default-touch-mode` 读保存的模式。
+gamescope 自带的触摸模式只有"触摸 = 某一个鼠标键"（1 左、2 右、3 中）、悬停（0）和原生直通（4）：
+没有右键、没有缩放，转视角的游戏（Unity 等读原始鼠标位移）也没法拖。
 
-## 手写笔（Lenovo Tab Pen Plus）
+**`tb-touch-gestures`**（用户服务，`steamos/rootfs/usr/local/bin/`）：游戏获得焦点且保存的模式不是 4 时，独占触摸屏和笔，
+把手势变成鼠标输入：
 
-gamescope 会打开 tablet 设备，但不处理 tablet-tool 事件。`tb-pen-touch` 用 uinput 把笔转成单指触摸：
-EVIOCGRAB 抓住 `NVTCapacitivePen`，打开 `/proc/support_pen`，笔尖按下即手指按下。
-笔因此和手指一样遵循上面的触摸模式；压感、悬停、侧键不使用。触摸驱动重新加载后会自动重新连接。
+| 手势 | 鼠标 |
+|---|---|
+| 单指轻点 | 左键单击 |
+| 单指按住移动 | 左键拖拽 |
+| 单指长按 0.45 秒 | 右键（松开 = 右键单击；继续移动 = 右键拖拽） |
+| 双指轻点 | 右键单击 |
+| 双指一起移动 | 右键拖拽（旋转视角；`TB_TWO_FINGER_BUTTON=2` 改为中键） |
+| 双指捏合 / 张开 | 滚轮（缩小 / 放大） |
+| 笔悬停 / 笔尖 / 按住侧键点 / 第二侧键 | 移动 / 左键 / 右键 / 中键 |
+
+实现要点（都是实测出来的）：
+- 光标定位用 **XTEST**，发到焦点游戏所在的 Xwayland（通常 `:1`）。gamescope 经 libei 把 XTEST 的坐标映射到**焦点窗口**的坐标系；
+  窗口在屏幕上按 `min(铺满所需倍数, --max-scale)` 放大并居中（SteamOS 会话里 `--max-scale 2`），触摸坐标按此反算。
+- 按键、滚轮，以及右/中键按住期间的移动，来自一个**虚拟相对鼠标**（uinput）。只有真正的相对位移才能让游戏转视角；
+  uinput 的"绝对坐标鼠标"gamescope 不接受；滚轮必须同时发 `REL_WHEEL_HI_RES`。
+- 只在屏幕上没有手指时切换独占状态：手指按着时开始独占，gamescope 就收不到这根手指的抬起，它的左键会一直卡在按下状态。
+- 进程异常退出时，uinput 设备随之销毁，按下的键会自动释放（XTEST 按下的键不会，所以不用 XTEST 发按键）。
+- 回到 Steam 界面（appid 769）时放开触摸屏，恢复原生触摸滑动；笔在 Steam 界面里转成单指触摸。
+- 笔扫描开关：udev 规则 `61-tb710fu-pen.rules` 在笔设备出现时写 `/proc/support_pen`。
+
+`tb-touch-auto` 仍负责 gamescope 自己的模式（Steam 界面 4、游戏里用保存的模式），作为手势服务停止时的后备。
+`tb-touch-mode 1|4` 和库里的两个快捷方式决定游戏里用"手势"（1）还是"原生触摸"（4，给原生支持触摸的游戏）。
+
+测试工具：`steamos/tools/mt.py`（脚本化多点触摸：tap、tap2、hold、drag、pan2、pinch）和 `btn.sh`（查看游戏 X 服务器上哪些键按着）可以配合 `TB_TOUCH_NAME="…"` 让服务接管一个虚拟触摸屏，
+用于在不碰平板的情况下脚本化测试手势。
 
 ## 电池
 

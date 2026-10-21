@@ -28,12 +28,14 @@ echo "== rootfs"
 cp -a --no-preserve=ownership "$REPO/steamos/rootfs/usr/." "$ROOT/usr/"
 cp -a --no-preserve=ownership "$REPO/steamos/rootfs/etc/." "$E/etc/"
 S=$E/etc/systemd/system; mkdir -p $S/multi-user.target.wants $S/display-manager.service.wants
-for u in tb-native-display tb-usb-ncm tb-usb-ncm-watch tb-wifi tb-audio-init tb-adsp-audio-check tb-touch-check tb-pen-touch; do
+for u in tb-native-display tb-usb-ncm tb-usb-ncm-watch tb-wifi tb-audio-init tb-adsp-audio-check tb-touch-check; do
   ln -sfn /etc/systemd/system/$u.service $S/multi-user.target.wants/$u.service
 done
 ln -sfn /etc/systemd/system/tb-native-display.service $S/display-manager.service.wants/tb-native-display.service
 mkdir -p $E/etc/systemd/user/gamescope-session.target.wants
-ln -sfn /etc/systemd/user/tb-touch-auto.service $E/etc/systemd/user/gamescope-session.target.wants/tb-touch-auto.service
+for u in tb-touch-auto tb-touch-gestures; do
+  ln -sfn /etc/systemd/user/$u.service $E/etc/systemd/user/gamescope-session.target.wants/$u.service
+done
 echo "== pen hwdb"
 systemd-hwdb update --usr --root="$ROOT"
 echo "== gamescope touch mode"
