@@ -1,0 +1,14 @@
+[Unit]
+Description=TB710FU native DSI panel (msm) bring-up before the display manager
+DefaultDependencies=no
+After=local-fs.target systemd-udev-settle.service systemd-modules-load.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/local/sbin/tb-native-display
+RemainAfterExit=yes
+TimeoutStartSec=60
+
+[Install]
+WantedBy=display-manager.service

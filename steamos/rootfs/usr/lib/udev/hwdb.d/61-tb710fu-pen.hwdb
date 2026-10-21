@@ -1,0 +1,8 @@
+# TB710FU: the NT36532 pen device (nvt_36xxx, novatek,pen-support) reports X/Y
+# 0-32000 / 0-20000 without a resolution, and libinput ignores tablets without
+# one ("missing tablet capabilities: resolution") -> gamescope never sees the pen.
+# 12.7" 16:10 panel = 273.5 x 171 mm -> 117 units/mm on both axes.
+# Installed to /usr/lib/udev/hwdb.d, then: systemd-hwdb update --usr
+evdev:name:NVTCapacitivePen:*
+ EVDEV_ABS_00=::117
+ EVDEV_ABS_01=::117

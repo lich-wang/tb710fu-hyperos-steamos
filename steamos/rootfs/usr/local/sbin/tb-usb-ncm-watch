@@ -1,0 +1,25 @@
+#!/bin/sh
+# TB710FU: USB NCM recovery. Seen 10/19: after a boot the host enumerated the gadget
+# (UDC state "configured") but usb0 stayed NO-CARRIER forever (host never activated
+# the NCM data interface) -> no 172.16.42.1. Re-binding the UDC fixes it, so do that
+# automatically when the cable is attached+configured but usb0 has no carrier twice in
+# a row. Does nothing when no cable is attached (state != configured).
+G=/sys/kernel/config/usb_gadget/g1
+miss=0
+while sleep 20; do
+	U=$(cat $G/UDC 2>/dev/null)
+	[ -n "$U" ] || { miss=0; continue; }
+	st=$(cat /sys/class/udc/$U/state 2>/dev/null)
+	car=$(cat /sys/class/net/usb0/carrier 2>/dev/null || echo 0)
+	if [ "$st" = configured ] && [ "$car" != 1 ]; then
+		miss=$((miss+1))
+	else
+		miss=0
+	fi
+	if [ $miss -ge 2 ]; then
+		echo "usb0 no carrier while $U configured -> rebinding UDC"
+		echo "" > $G/UDC; sleep 2; echo "$U" > $G/UDC; sleep 3
+		ip link set usb0 up
+		miss=0
+	fi
+done

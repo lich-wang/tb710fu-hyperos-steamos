@@ -1,0 +1,22 @@
+# device-specific inputs, backups, firmware and build outputs never go into git
+/work/
+/out/
+/freedom/
+*.img
+*.bin
+*.mbn
+*.melf
+*.ko
+*.apk
+*.jks
+*.keystore
+*.pem
+*.zst
+*.tar
+*.zip
+*.7z*
+*.psk
+credentials*
+.DS_Store
+__pycache__/
+*.pyc

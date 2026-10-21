@@ -1,0 +1,4 @@
+# Force HWUI to Skia/OpenGL (default on this build is Skia/Vulkan).
+# With Vulkan the TextureView in com.xiaomi.miralink converts the Mac's BT.709 full-range
+# AirPlay stream as BT.601 limited range. Measured 2026-10-12, see extras/mac_airplay_icc/README.md.
+debug.hwui.renderer=skiagl

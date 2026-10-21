@@ -1,0 +1,20 @@
+#!/bin/sh
+# TB710FU speakers: route MultiMedia1 -> SECONDARY_TDM_RX_0 (4x AW882xx on an
+# 8x32 TDM frame, configured like HyperOS) and enable the amps.
+for i in $(seq 1 60); do [ -e /proc/asound/card0/pcm0p/sub0/status ] && break; sleep 1; done
+[ -e /proc/asound/card0/pcm0p/sub0/status ] || exit 1
+A="amixer -q -c 0 cset"
+$A name='SECONDARY_TDM_RX_0 Audio Mixer MultiMedia1' 1
+$A name='aw882xx_rx_switch' 1
+# DSP gain 0 dB (8192 = unity, linear); +9 dB clipped once all 4 speakers played (10/20)
+$A name='stream0.vol_ctrl0 MultiMedia1 Playback Volume' 8192 2>/dev/null || true
+# Amp attenuation as on HyperOS (register 0x05 low 10 bits = 21 on 0x34/0x35, 11 on
+# 0x36/0x37; control = register - 11). The old value 200 attenuated ~190 steps more.
+for i in 0 1 2 3; do
+  $A name="aw_dev_${i}_switch" 1
+  # monitor needs ADSP V/I feedback that mainline does not provide
+  $A name="aw_dev_${i}_monitor" 0
+done
+$A name="aw_dev_0_volume" 10; $A name="aw_dev_1_volume" 10
+$A name="aw_dev_2_volume" 0;  $A name="aw_dev_3_volume" 0
+exit 0

@@ -1,0 +1,6 @@
+id=tb710fu_faceunlock
+name=TB710FU 2D face unlock (test)
+version=1
+versionCode=1
+author=tb710fu
+description=Add PearlBiometric (com.miui.face, from HyperOS 3 port) and set support_tee_face_unlock=false (no TEE face HAL)

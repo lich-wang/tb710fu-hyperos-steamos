@@ -1,0 +1,23 @@
+#!/bin/sh
+# TB710FU: USB NCM gadget for ssh from the Mac (tablet 172.16.42.1, Mac gets .2-.10 by DHCP).
+# Skips the gadget setup when the initramfs already bound one (NBD-root boots).
+G=/sys/kernel/config/usb_gadget/g1
+mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
+modprobe libcomposite 2>/dev/null
+for r in /sys/class/usb_role/*/role; do [ -e "$r" ] && echo device > "$r" 2>/dev/null; done
+if [ -z "$(cat $G/UDC 2>/dev/null)" ]; then
+  n=0; while [ $n -lt 30 ] && [ -z "$(ls /sys/class/udc 2>/dev/null)" ]; do sleep 1; n=$((n+1)); done
+  UDC=$(ls /sys/class/udc | head -1)
+  mkdir -p $G; cd $G
+  echo 0x1d6b > idVendor; echo 0x0104 > idProduct
+  mkdir -p strings/0x409; echo TB710FU-steamos > strings/0x409/product; echo tb710fu > strings/0x409/serialnumber
+  mkdir -p functions/ncm.usb0 configs/c.1/strings/0x409; echo ncm > configs/c.1/strings/0x409/configuration
+  [ -e configs/c.1/ncm.usb0 ] || ln -s functions/ncm.usb0 configs/c.1/
+  echo $UDC > UDC; cd /; sleep 2
+fi
+ip addr replace 172.16.42.1/24 dev usb0; ip link set usb0 up
+mkdir -p /run/udhcpd
+printf "start 172.16.42.2\nend 172.16.42.10\ninterface usb0\noption subnet 255.255.255.0\nlease_file /run/udhcpd/leases.svc\n" > /run/udhcpd/svc.conf
+touch /run/udhcpd/leases.svc
+pgrep -f "udhcpd /run/udhcpd/conf" >/dev/null && exit 0   # initramfs udhcpd still serving
+exec busybox udhcpd -f /run/udhcpd/svc.conf

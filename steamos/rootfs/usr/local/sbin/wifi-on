@@ -1,0 +1,10 @@
+#!/bin/sh
+# TB710FU: load ath12k on demand (it has hung this board in the past), then let NetworkManager take over.
+set -e
+rfkill unblock wifi 2>/dev/null || true
+modprobe ath12k_wifi7 || modprobe ath12k
+echo "waiting for phy0 (cold boot can take ~110 s)..."
+i=0; while [ $i -lt 90 ] && [ ! -d /sys/class/ieee80211/phy0 ]; do sleep 2; i=$((i+1)); done
+[ -d /sys/class/ieee80211/phy0 ] && echo "phy0 after $((i*2)) s" || { echo "phy0 did not appear"; exit 1; }
+iw reg set CN 2>/dev/null || true
+nmcli radio wifi on 2>/dev/null || true

@@ -1,0 +1,16 @@
+#!/bin/sh
+# ssh into SteamOS on the TB710FU as steamos (USB NCM 172.16.42.1).
+#   tbsos 'cmd'          run as steamos
+#   tbsos -s 'cmd'       run as root (sudo password from $TB_SUDO_PASS, or the first line of
+#                        ~/.config/tb710fu/steamos-password; never commit it)
+H=${TB_HOST:-172.16.42.1}
+O="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o LogLevel=ERROR -o ServerAliveInterval=15"
+if [ "$1" = -s ]; then
+  shift
+  PW=${TB_SUDO_PASS:-$(head -1 "$HOME/.config/tb710fu/steamos-password" 2>/dev/null)}
+  # password on the first stdin line for sudo -S; the command's own stdout is untouched
+  exec ssh $O steamos@$H "sudo -S -p '' sh -c $(printf '%s' "$*" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")" <<EOF2
+$PW
+EOF2
+fi
+exec ssh $O steamos@$H "$@"

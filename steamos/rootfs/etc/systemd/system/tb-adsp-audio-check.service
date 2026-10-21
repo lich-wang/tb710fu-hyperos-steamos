@@ -1,0 +1,9 @@
+[Unit]
+Description=TB710FU: restart the ADSP if its audio PD did not come up
+After=multi-user.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tb-adsp-audio-check
+ExecStartPost=-/usr/bin/systemctl restart tb-audio-init.service
+[Install]
+WantedBy=multi-user.target

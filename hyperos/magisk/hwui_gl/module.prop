@@ -1,0 +1,6 @@
+id=tb710fu_hwui_gl
+name=TB710FU HWUI OpenGL
+version=1.0
+versionCode=1
+author=tb710fu
+description=debug.hwui.renderer=skiagl. Vulkan HWUI makes the Xiaomi wireless display (miralink TextureView) decode BT.709 full-range video as BT.601 limited (crushed blacks, wrong colours).

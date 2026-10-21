@@ -1,0 +1,4 @@
+#!/bin/sh
+# tbsos over the USB link's IPv6 link-local address (when DHCP on usb0 is down)
+A=$(ping6 -c2 -I ${TB_IF:-en11} ff02::1 2>/dev/null | grep -oE "fe80::[0-9a-f:]+" | sort -u | grep -v "$(ifconfig ${TB_IF:-en11} | grep -oE 'fe80::[0-9a-f:]+' | head -1)" | head -1)
+TB_HOST="$A%${TB_IF:-en11}" exec "$(dirname "$0")/tbsos" "$@"

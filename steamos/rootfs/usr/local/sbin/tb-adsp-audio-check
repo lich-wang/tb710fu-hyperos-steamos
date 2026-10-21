@@ -1,0 +1,13 @@
+#!/bin/sh
+# TB710FU: the ADSP sometimes boots before qcom_pd_mapper is serving, so its audio PD never
+# comes up (no PDR indication, no GPR devices, no sound card). Restarting the ADSP once the
+# system is up fixes it (seen 3 of 4 boots on 10/20). Try at most twice. After a restart the
+# card is new, so tb-audio-init (routing, amp volumes) is run again.
+R=$(dirname $(grep -l '^adsp$' /sys/class/remoteproc/*/name | head -1))
+for try in 1 2 3; do
+  for i in $(seq 1 25); do grep -q TB710FU /proc/asound/cards 2>/dev/null && { echo "sound card up (try $try)"; [ $try = 1 ] || systemctl restart tb-audio-init.service; exit 0; }; sleep 1; done
+  [ $try = 3 ] && break
+  echo "no sound card -> restarting ADSP ($R, try $try)"
+  echo stop > $R/state; sleep 2; echo start > $R/state
+done
+echo "sound card still missing"; exit 1

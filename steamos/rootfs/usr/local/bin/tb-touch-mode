@@ -1,0 +1,10 @@
+#!/bin/bash
+# TB710FU: switch gamescope's touchscreen mode at runtime and remember it.
+#   tb-touch-mode 1   touch = left mouse click (Windows/Proton games)
+#   tb-touch-mode 4   native touch passthrough (touch-aware games)
+# gamescope reads STEAM_TOUCH_CLICK_MODE on the root window of Steam's Xwayland (:0);
+# /usr/lib/steamos/gamescope-session starts with the saved mode (default 1).
+M=${1:-1}
+case "$M" in 0|1|2|3|4) ;; *) echo "usage: $0 0|1|2|3|4"; exit 1;; esac
+mkdir -p "$HOME/.config/tb710fu"; echo "$M" > "$HOME/.config/tb710fu/touch-mode"
+DISPLAY=:0 xprop -root -f STEAM_TOUCH_CLICK_MODE 32c -set STEAM_TOUCH_CLICK_MODE "$M"

@@ -1,0 +1,25 @@
+#!/bin/sh
+# TB710FU: bring up the native DSI panel (msm-kms) before the display manager.
+# The display modules are blacklisted (install -> /bin/false) so udev never loads
+# them on its own; this script loads them in order, then does tbl's DRM off/on
+# cycle (cold-boot "panel latch race": lit but blank until the panel is re-enabled).
+LOG=/run/tb-native-display.log
+exec >>$LOG 2>&1
+date
+for m in aw37503_regulator sy7758 dispcc_sm8550 panel_nt36532_wqhd_dual_dsi_dsc msm; do
+	modprobe -i $m && echo "loaded $m" || echo "FAILED $m"
+done
+CARD=
+i=0
+while [ $i -lt 40 ]; do
+	for c in /sys/class/drm/card*-DSI-*; do
+		[ -e "$c" ] && CARD=/dev/dri/$(basename "$c" | cut -d- -f1)
+	done
+	[ -n "$CARD" ] && [ -e "$CARD" ] && break
+	sleep 0.5; i=$((i+1))
+done
+[ -n "$CARD" ] || { echo "no DSI connector"; exit 0; }
+echo "card=$CARD"
+sleep 1
+TB_CARD=$CARD python3 /usr/local/sbin/tb-panel-cycle-py 1
+echo done

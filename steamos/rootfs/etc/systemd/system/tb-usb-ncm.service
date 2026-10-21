@@ -1,0 +1,9 @@
+[Unit]
+Description=TB710FU USB NCM gadget (172.16.42.1) for ssh
+After=systemd-modules-load.service
+[Service]
+ExecStart=/usr/local/sbin/tb-usb-ncm
+Restart=on-failure
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target

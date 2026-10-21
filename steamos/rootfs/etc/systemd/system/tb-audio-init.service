@@ -1,0 +1,10 @@
+[Unit]
+Description=TB710FU speaker routing (TDM + AW882xx)
+After=sound.target
+Wants=sound.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tb-audio-init
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target

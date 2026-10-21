@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="config_tether_ncm_regexs">
+        <item>usb\\d</item>
+        <item>ncm\\d</item>
+    </string-array>
+</resources>

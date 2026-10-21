@@ -1,0 +1,11 @@
+[Unit]
+Description=TB710FU WiFi (ath12k on demand, NetworkManager connects)
+After=NetworkManager.service
+Wants=NetworkManager.service
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/sbin/wifi-on
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=TB710FU USB NCM carrier watchdog (rebind UDC when stuck)
+After=tb-usb-ncm.service
+Wants=tb-usb-ncm.service
+
+[Service]
+ExecStart=/usr/local/sbin/tb-usb-ncm-watch
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

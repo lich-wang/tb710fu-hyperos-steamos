@@ -1,0 +1,52 @@
+#!/bin/sh
+# tbboot android|linux [boot-dir]
+# Reboot the TB710FU into the given OS without touching the menu: writes the
+# kShimC boot image whose menu default is that OS into boot_a (from HyperOS via
+# adb+su, or from Debian via ssh+sudo), verifies the read-back sha256, reboots.
+# boot-dir defaults to work/boot/current (boot_android.img / boot_linux.img, from tools/kshim_variants.sh).
+set -e
+T=${1:?usage: tbboot android|linux [boot-dir]}
+DIR=${2:-$(cd "$(dirname "$0")/../.." && pwd)/work/boot/current}
+IMG="$DIR/boot_$T.img"
+[ -f "$IMG" ] || { echo "missing $IMG" >&2; exit 1; }
+WANT=$(shasum -a 256 "$IMG" | cut -c1-64)
+SSH="$(dirname "$0")/tbssh"
+
+if [ "$(adb get-state 2>/dev/null)" = device ]; then
+  echo "running OS: HyperOS (adb)"
+  HAVE=$(adb shell "su -c 'dd if=/dev/block/by-name/boot_a bs=1048576 2>/dev/null'" | shasum -a 256 | cut -c1-64)
+  if [ "$HAVE" != "$WANT" ]; then
+    adb push "$IMG" /data/local/tmp/kshim_boot.img >/dev/null
+    adb shell "su -c 'dd if=/data/local/tmp/kshim_boot.img of=/dev/block/by-name/boot_a bs=1048576 2>/dev/null && sync && rm /data/local/tmp/kshim_boot.img'"
+    HAVE=$(adb shell "su -c 'dd if=/dev/block/by-name/boot_a bs=1048576 2>/dev/null'" | shasum -a 256 | cut -c1-64)
+  fi
+  [ "$HAVE" = "$WANT" ] || { echo "boot_a read-back mismatch: $HAVE" >&2; exit 1; }
+  echo "boot_a = boot_$T ($WANT), rebooting"
+  adb reboot
+elif "$SSH" true 2>/dev/null; then
+  echo "running OS: Debian (ssh)"
+  P=/dev/disk/by-partlabel/boot_a
+  HAVE=$("$SSH" "sudo dd if=$P bs=1048576 2>/dev/null | sha256sum" | cut -c1-64)
+  if [ "$HAVE" != "$WANT" ]; then
+    "$SSH" "sudo dd of=$P bs=1048576 2>/dev/null && sync" < "$IMG"
+    HAVE=$("$SSH" "sudo dd if=$P bs=1048576 2>/dev/null | sha256sum" | cut -c1-64)
+  fi
+  [ "$HAVE" = "$WANT" ] || { echo "boot_a read-back mismatch: $HAVE" >&2; exit 1; }
+  echo "boot_a = boot_$T ($WANT), rebooting"
+  "$SSH" "sudo systemctl reboot" || true
+elif "$(dirname "$0")/tbsos" true 2>/dev/null; then
+  echo "running OS: SteamOS (ssh steamos)"
+  T="$(dirname "$0")/tbsos"
+  P=/dev/disk/by-partlabel/boot_a
+  HAVE=$($T -s "dd if=$P bs=1048576 2>/dev/null | sha256sum" | cut -c1-64)
+  if [ "$HAVE" != "$WANT" ]; then
+    scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "$IMG" steamos@172.16.42.1:/tmp/kshim_boot.img
+    $T -s "dd if=/tmp/kshim_boot.img of=$P bs=1048576 conv=fsync 2>/dev/null; rm -f /tmp/kshim_boot.img"
+    HAVE=$($T -s "dd if=$P bs=1048576 2>/dev/null | sha256sum" | cut -c1-64)
+  fi
+  [ "$HAVE" = "$WANT" ] || { echo "boot_a read-back mismatch: $HAVE" >&2; exit 1; }
+  echo "boot_a = boot_$1 ($WANT), rebooting"
+  $T -s "systemctl reboot" || true
+else
+  echo "tablet not reachable (no adb device, no ssh 172.16.42.1)" >&2; exit 1
+fi

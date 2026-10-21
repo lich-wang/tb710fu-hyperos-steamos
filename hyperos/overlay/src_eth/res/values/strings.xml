@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- TB710FU: the Lenovo kernel names the NCM gadget usb0; keep EthernetTracker off it so tethering keeps its IPv4 -->
+    <string name="config_ethernet_iface_regex">eth\\d+</string>
+</resources>

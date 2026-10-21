@@ -1,0 +1,13 @@
+#!/bin/sh
+# TB710FU: nvt_36xxx sometimes probes before the NT36532 touch IC answers
+# (chip ver trim reads all zeros -> "chip is not identified", -22) and the
+# touchscreen is missing for the whole session. Reload the driver until the
+# input device shows up (seen 10/20 on SteamOS; a reload always worked).
+has() { grep -q 'Name="NVTCapacitiveTouchScreen"' /proc/bus/input/devices; }
+for i in 1 2 3 4 5 6 7 8 9 10; do has && exit 0; sleep 1; done
+for try in 1 2 3; do
+  echo "tb-touch-check: touchscreen missing, reloading nvt_36xxx (try $try)"
+  modprobe -r nvt_36xxx; sleep 1; modprobe nvt_36xxx
+  for i in 1 2 3 4 5 6 7 8 9 10; do has && { echo "tb-touch-check: touchscreen back"; exit 0; }; sleep 1; done
+done
+echo "tb-touch-check: touchscreen still missing"; exit 1

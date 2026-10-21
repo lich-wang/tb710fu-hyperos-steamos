@@ -1,0 +1,18 @@
+#!/bin/sh
+# ssh into the TB710FU Debian root: USB NCM 172.16.42.1 first, else WiFi (found by the
+# tablet's WiFi MAC $TB_WIFI_MAC in the ARP table, or $TB_WIFI_IP)
+H=172.16.42.1
+if ! nc -z -G 2 $H 22 >/dev/null 2>&1; then
+  # macOS arp prints MAC bytes without leading zeros (aa:b:cc:...)
+  M=$(printf '%s' "${TB_WIFI_MAC:-none}" | sed -E 's/(^|:)0([0-9a-fA-F])/\1\2/g')
+  H=${TB_WIFI_IP:-$(arp -an | grep -i " at $M " | sed -n 's/.*(\([0-9.]*\)).*/\1/p' | head -1)}
+  [ -n "$H" ] || { echo "tablet not on USB; set TB_WIFI_IP or TB_WIFI_MAC" >&2; exit 1; }
+fi
+# over WiFi bind to the Mac's own WiFi address: the default route may be a wired NIC
+# (en7) that cannot reach WiFi clients on the same subnet
+B=
+if [ "$H" != 172.16.42.1 ]; then
+  W=$(ipconfig getifaddr en0 2>/dev/null)
+  [ -n "$W" ] && B="-b $W"
+fi
+exec ssh $B -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR tb@$H "$@"

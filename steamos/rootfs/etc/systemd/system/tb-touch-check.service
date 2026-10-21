@@ -1,0 +1,10 @@
+[Unit]
+Description=TB710FU: reload the touchscreen driver if its probe failed
+After=tb-native-display.service systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tb-touch-check
+
+[Install]
+WantedBy=multi-user.target

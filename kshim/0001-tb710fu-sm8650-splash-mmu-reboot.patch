@@ -1,0 +1,629 @@
+--- a/src/dt/splash.c	2026-10-19 10:58:10
++++ b/src/dt/splash.c	2026-10-19 11:00:57
+@@ -120,6 +120,58 @@
+     return n;
+ }
+ 
++/* TB710FU: raw MDSS register dump (read-only), see qcom_dt.h. */
++#define TB710FU_DUMP_WORDS 64
++static uint32_t g_tb710fu_dump[TB710FU_DUMP_WORDS];
++static unsigned g_tb710fu_dump_count;
++static void tb710fu_dump_capture(uint64_t base, uint64_t size, const struct CrIo *io,
++                                 const uint32_t *ctl, int ctls, const uint32_t *mixer,
++                                 int mixers, const uint32_t *pipe, int pipes)
++{
++    static const uint16_t ctl0_regs[10] = {0xf4, 0x14, 0x00, 0x04, 0x08, 0x0c,
++                                           0x40, 0x44, 0x48, 0x4c};
++    static const uint16_t vig_regs[6] = {0x00, 0x08, 0x14, 0x24, 0x30, 0x34};
++    uint64_t offs[TB710FU_DUMP_WORDS];
++    unsigned n = 0;
++    g_tb710fu_dump_count = 0;
++    if (!io || !io->read32 || ctls < 1 || mixers < 4 || pipes < 6) return;
++    for (unsigned i = 0; i < 10; ++i) offs[n++] = (uint64_t)ctl[0] + ctl0_regs[i];
++    for (unsigned m = 0; m < 4; ++m) { offs[n++] = mixer[m]; offs[n++] = (uint64_t)mixer[m] + 4; }
++    for (unsigned p = 0; p < 4; ++p)
++        for (unsigned k = 0; k < 6; ++k) offs[n++] = (uint64_t)pipe[p] + vig_regs[k];
++    for (unsigned p = 4; p < 6; ++p) { offs[n++] = pipe[p]; offs[n++] = (uint64_t)pipe[p] + 0x14; }
++    for (unsigned i = 0; i < n; ++i)
++        if ((offs[i] & 3) || offs[i] + 4 > size) return;
++    for (unsigned i = 0; i < n; ++i)
++        g_tb710fu_dump[i] = io->read32(io->context, (uintptr_t)(base + offs[i]));
++    g_tb710fu_dump_count = n;
++}
++static struct CrSplash g_tb710fu_fb;
++static int g_tb710fu_fb_status = 1;
++int kshim_tb710fu_fb_report(char *out, size_t capacity)
++{
++    if (!out || capacity < 81 || g_tb710fu_fb_status > 0) return -1;
++    return snprintf(out, capacity, "r31:s=%d:a=%llx:w=%u:h=%u:st=%u:f=%u:sz=%llx",
++                    g_tb710fu_fb_status, (unsigned long long)g_tb710fu_fb.address,
++                    (unsigned)g_tb710fu_fb.width, (unsigned)g_tb710fu_fb.height,
++                    (unsigned)g_tb710fu_fb.stride, (unsigned)g_tb710fu_fb.format,
++                    (unsigned long long)g_tb710fu_fb.size);
++}
++int kshim_tb710fu_dump_report(unsigned slot, char *out, size_t capacity)
++{
++    if (!out || capacity < 81 || slot > 7 || !g_tb710fu_dump_count) return -1;
++    int n = snprintf(out, capacity, "r30:%u:", slot);
++    if (n != 6) return -1;
++    for (unsigned i = 0; i < 8; ++i) {
++        unsigned idx = slot * 8u + i;
++        uint32_t w = idx < g_tb710fu_dump_count ? g_tb710fu_dump[idx] : 0xdeadbeefu;
++        int m = snprintf(out + n, capacity - (size_t)n, "%08x", (unsigned)w);
++        if (m != 8) return -1;
++        n += m;
++    }
++    return n;
++}
++
+ struct kshim_splash_trace_ctx {
+     const struct CrIo *io;
+     uintptr_t base;
+@@ -204,6 +256,82 @@
+     }
+     if (found < 0) return -1;
+     if (no_map) *no_map = fdt_getprop(f, found, "no-map", NULL) != NULL;
++    return 0;
++}
++/* TB710FU / SM8650: ABL scans one linear framebuffer out through several
++ * VIG/DMA pipes side by side (measured: 4 x VIG 800x2000 from 0xd5100000,
++ * stride 12800, ARGB-family 0x237ff), one LM per pipe.  Instead of decoding
++ * CTL/LM routing, take every SSPP with a programmed size and require that
++ * the set tiles one contiguous WxH buffer: same base/stride/format/unpack/
++ * height, x offsets 0..W without gaps, buffer inside cont_splash_region.
++ * Read twice; any change -> CR_BUS_AGAIN.  Read-only. */
++struct tb710fu_pipe { uint32_t src, xy, out_xy, addr, stride, format, unpack, op; };
++static int tb710fu_read_pipes(const struct CrSplashResources *r, const struct CrIo *io,
++                              struct tb710fu_pipe *pp)
++{
++    for (unsigned p = 0; p < r->pipe_count; ++p) {
++        uint64_t b = r->base + r->pipe[p];
++        pp[p] = (struct tb710fu_pipe){
++            .src = io->read32(io->context, (uintptr_t)(b + 0x00)),
++            .xy = io->read32(io->context, (uintptr_t)(b + 0x08)),
++            .out_xy = io->read32(io->context, (uintptr_t)(b + 0x10)),
++            .addr = io->read32(io->context, (uintptr_t)(b + 0x14)),
++            .stride = io->read32(io->context, (uintptr_t)(b + 0x24)),
++            .format = io->read32(io->context, (uintptr_t)(b + 0x30)),
++            .unpack = io->read32(io->context, (uintptr_t)(b + 0x34)),
++            .op = io->read32(io->context, (uintptr_t)(b + 0x38))};
++    }
++    return 0;
++}
++static int tb710fu_splash_read(const struct CrSplashResources *r, const struct CrIo *io,
++                               struct CrSplash *fb)
++{
++    struct tb710fu_pipe a[10], b[10];
++    if (!io || !io->read32 || r->pipe_count == 0 || r->pipe_count > 10) return CR_BUS_INVALID;
++    for (unsigned p = 0; p < r->pipe_count; ++p)
++        if ((r->pipe[p] & 3) || (uint64_t)r->pipe[p] + 0x3c > r->size) return CR_BUS_INVALID;
++    if (!io->read32(io->context, (uintptr_t)(r->base + r->ctl[0] + 0xf4))) return CR_BUS_UNSUPPORTED;
++    tb710fu_read_pipes(r, io, a);
++    int first = -1; unsigned used = 0, width = 0, h = 0, bpp = 4;
++    uint32_t covered_end[10]; unsigned nseg = 0; uint32_t seg_x[10], seg_w[10];
++    (void)covered_end;
++    for (unsigned p = 0; p < r->pipe_count; ++p) {
++        const struct tb710fu_pipe *s = &a[p];
++        if (!s->src || !s->addr) continue;
++        if (first < 0) first = (int)p;
++        const struct tb710fu_pipe *f0 = &a[first];
++        if (s->addr != f0->addr || s->stride != f0->stride || s->format != f0->format ||
++            s->unpack != f0->unpack || (s->src >> 16) != (f0->src >> 16) ||
++            (s->xy >> 16) || (s->op & ~((1u << 31) | (1u << 4)))) return CR_BUS_UNSUPPORTED;
++        seg_x[nseg] = s->xy & 0xffff; seg_w[nseg] = s->src & 0xffff; ++nseg;
++        width += s->src & 0xffff; ++used;
++    }
++    if (first < 0 || used == 0) return CR_BUS_UNSUPPORTED;
++    /* segments must tile [0, width) exactly */
++    for (unsigned x = 0; x < width;) {
++        unsigned k;
++        for (k = 0; k < nseg; ++k) if (seg_x[k] == x) break;
++        if (k == nseg || seg_w[k] == 0) return CR_BUS_UNSUPPORTED;
++        x += seg_w[k];
++    }
++    const struct tb710fu_pipe *f0 = &a[first];
++    enum CrSplashFormat fmt;
++    uint32_t v = f0->format & ~(1u << 8);
++    if (v != 0x236ff) return CR_BUS_UNSUPPORTED;
++    if (f0->unpack == 0x03020001) fmt = (f0->format & 256) ? CR_SPLASH_ARGB8888 : CR_SPLASH_XRGB8888;
++    else if (f0->unpack == 0x03010002) fmt = (f0->format & 256) ? CR_SPLASH_ABGR8888 : CR_SPLASH_XBGR8888;
++    else return CR_BUS_UNSUPPORTED;
++    h = f0->src >> 16;
++    uint32_t stride = f0->stride & 0xffff;
++    if (!h || h > 8192 || !width || width > 8192 || (uint64_t)width * bpp > stride) return CR_BUS_INVALID;
++    uint64_t size = (uint64_t)stride * h;
++    if (!r->reserved_size || f0->addr < r->reserved_base ||
++        (uint64_t)f0->addr + size > r->reserved_base + r->reserved_size) return CR_BUS_INVALID;
++    tb710fu_read_pipes(r, io, b);
++    for (unsigned p = 0; p < r->pipe_count; ++p)
++        if (memcmp(&a[p], &b[p], sizeof(a[p]))) return CR_BUS_AGAIN;
++    *fb = (struct CrSplash){.address = f0->addr, .size = (size_t)size, .width = width,
++                           .height = h, .stride = stride, .format = fmt};
+     return 0;
+ }
+ int kshim_dt_splash(const void *f, const struct CrIo *io,
+@@ -225,6 +353,10 @@
+     int root_compatible_count = fdt_stringlist_count(f, 0, "compatible");
+     bool root_has_sunp = root_compatible_count > 0 &&
+         fdt_stringlist_search(f, 0, "compatible", "qcom,sunp") >= 0;
++    /* TB710FU: SM8650 (DPU 10, legacy CTL layer routing) lists 10 SSPPs and
++     * 10 mixer slots (6 real + 0xf0f dummies) in its downstream SDE node. */
++    bool pineapple = root_compatible_count > 0 &&
++        fdt_stringlist_search(f, 0, "compatible", "qcom,pineapple") >= 0;
+ #if KSHIM_DIAGNOSTIC_RESOURCES_ONLY
+     g_kshim_splash_trace.root_compatible_count = root_compatible_count;
+     g_kshim_splash_trace.root_has_sunp = root_has_sunp;
+@@ -287,7 +419,8 @@
+     bool lm_source_select = sun || canoe;
+     resources.lm_source_select = lm_source_select;
+     resources.sspp_rec_separated = canoe;
+-    int pipes = offsets(f, sde, "qcom,sde-sspp-off", resources.pipe, lm_source_select ? 10 : 8);
++    int pipes = offsets(f, sde, "qcom,sde-sspp-off", resources.pipe,
++                        (lm_source_select || pineapple) ? 10 : 8);
+     int ctls = offsets(f, sde, "qcom,sde-ctl-off", resources.ctl, 8);
+ #if KSHIM_DIAGNOSTIC_RESOURCES_ONLY
+     /* Stage 6: mixer offset parsing/compaction. */
+@@ -309,6 +442,17 @@
+             ++count;
+         }
+         if (count < 1) return -1;
++    } else if (pineapple) {
++        /* Keep only the leading real LMs (CTL layer index == LM index). */
++        raw_n = offsets(f, sde, "qcom,sde-mixer-off", raw, 12);
++        count = 0;
++        for (int i = 0; i < raw_n; ++i) {
++            if (raw[i] == 0 || raw[i] == 0xf0f) break;
++            if (count == 6) return -1;
++            resources.mixer[count++] = raw[i];
++        }
++        for (int i = count; i < raw_n; ++i)
++            if (raw[i] != 0 && raw[i] != 0xf0f) return -1;
+     } else {
+         count = offsets(f, sde, "qcom,sde-mixer-off", resources.mixer, 6);
+     }
+@@ -333,7 +477,7 @@
+     /* Stage 9: SSPP type table. */
+     g_kshim_splash_trace.dt_stage = 9;
+ #endif
+-    unsigned vig = 0, dma = 0, dma_max = lm_source_select ? 6 : 4;
++    unsigned vig = 0, dma = 0, dma_max = (lm_source_select || pineapple) ? 6 : 4;
+     int types = fdt_stringlist_count(f, sde, "qcom,sde-sspp-type");
+     for (int i = 0; i < pipes; ++i) {
+         int len;
+@@ -343,6 +487,22 @@
+         else if (len == 3 && !memcmp(type, "dma", 3) && dma < dma_max) resources.pipe_id[i] = 4 + dma++;
+         else return -1;
+     }
++    struct CrSplash scanout;
++    if (pineapple && !lm_source_select) {
++#if KSHIM_DIAGNOSTIC_RESOURCES_ONLY
++        tb710fu_dump_capture(reg.base, reg.size, io, resources.ctl, ctls,
++                             resources.mixer, count, resources.pipe, pipes);
++        g_kshim_splash_trace.dt_stage = 12;
++#endif
++        resources.pipe_count = pipes;
++        int pstatus = tb710fu_splash_read(&resources, io, &scanout);
++#if KSHIM_DIAGNOSTIC_RESOURCES_ONLY
++        g_tb710fu_fb_status = pstatus;
++        if (!pstatus) g_tb710fu_fb = scanout;
++#endif
++        if (pstatus) return pstatus;
++        goto have_scanout;
++    }
+     if (sun_fallback) {
+ #if KSHIM_DIAGNOSTIC_RESOURCES_ONLY
+         /* Stage 10: Sun fallback shape validation. */
+@@ -360,7 +520,6 @@
+         for (int i = 8; i < 12; ++i)
+             if (raw[i] != 0 && raw[i] != 0xf0f) return -1;
+     }
+-    struct CrSplash scanout;
+ #if KSHIM_DIAGNOSTIC_RESOURCES_ONLY
+     /* Stage 11: CrSplashRead. */
+     g_kshim_splash_trace.dt_stage = 11;
+@@ -387,6 +546,7 @@
+     }
+ #endif
+     if (status) return status;
++have_scanout:;
+     static const kshim_fb_format_t formats[] = {KSHIM_FB_FORMAT_RGB565, KSHIM_FB_FORMAT_XRGB8888,
+         KSHIM_FB_FORMAT_ARGB8888, KSHIM_FB_FORMAT_XBGR8888, KSHIM_FB_FORMAT_ABGR8888};
+     *fb = (kshim_framebuffer_config_t){.render_address = scanout.address,
+--- a/src/core/main.c	2026-10-19 10:58:10
++++ b/src/core/main.c	2026-10-19 11:07:29
+@@ -372,6 +372,11 @@
+         asm volatile("wfe");
+ #endif
+     const void *runtime_fdt = (const void *)(uintptr_t)device_tree_address;
++    /* TB710FU: cache this runtime + the FDT for the DT/resource phase. */
++    int early_mmu = -1;
++    if (runtime_fdt && fdt_check_header(runtime_fdt) == 0)
++        early_mmu = kshim_mmu_early_enable(device_tree_address, fdt_totalsize(runtime_fdt));
++    (void)early_mmu;
+     if (!runtime_fdt || dt_validate(runtime_fdt, fdt_totalsize(runtime_fdt))) {
+         runtime_fdt = NULL;
+         device_tree_address = 0;
+@@ -475,8 +480,12 @@
+         resources_only_status = kshim_resources_init(
+             runtime_fdt, fdt_totalsize(runtime_fdt));
+     const uint64_t resources_only_after_time = get_current_time();
++    (void)kshim_mmu_early_disable();
+ #else
+-    if (runtime_fdt && kshim_resources_init(runtime_fdt, fdt_totalsize(runtime_fdt))) {
++    int resources_status = runtime_fdt ?
++        kshim_resources_init(runtime_fdt, fdt_totalsize(runtime_fdt)) : 0;
++    (void)kshim_mmu_early_disable();
++    if (resources_status) {
+         printf("Invalid runtime device resources\n");
+         for (;;) (void)delay(100000);
+     }
+@@ -504,9 +513,9 @@
+          * entry->before and before->after millisecond deltas (get_current_time
+          * is milliseconds). */
+         nres = snprintf(res_report, sizeof(res_report),
+-                        "res1:rc=%d:sp=%d:n=%u:m=%u:dt=%llu:res=%llu",
++                        "res1:rc=%d:sp=%d:n=%u:m=%u:em=%d:dt=%llu:res=%llu",
+                         resources_only_status, r->spmi_status,
+-                        (unsigned)r->spmi_count, (unsigned)r->mapping_count,
++                        (unsigned)r->spmi_count, (unsigned)r->mapping_count, early_mmu,
+                         (unsigned long long)(resources_only_before_time -
+                                              resources_only_entry_time),
+                         (unsigned long long)(resources_only_after_time -
+@@ -629,6 +638,17 @@
+                     (void)dt_probe_report_slot((void *)runtime_fdt, slot,
+                                                report);
+             }
++            /* TB710FU: raw MDSS dump into kshim_s1..s8 (write-once slots;
++             * a slot already filled above is refused harmlessly). */
++            n = kshim_tb710fu_fb_report(report, sizeof(report));
++            if (n > 0 && n < (int)sizeof(report))
++                (void)dt_probe_report_slot((void *)runtime_fdt, 1, report);
++            for (slot = 0; slot < 7; slot++) {
++                n = kshim_tb710fu_dump_report(slot, report, sizeof(report));
++                if (n > 0 && n < (int)sizeof(report))
++                    (void)dt_probe_report_slot((void *)runtime_fdt, slot + 2,
++                                               report);
++            }
+         }
+ #endif
+ #endif
+--- a/src/core/platform.c	2026-10-19 11:12:52
++++ b/src/core/platform.c	2026-10-19 11:15:36
+@@ -131,6 +131,65 @@
+ static int SmpInitialized;
+ #endif
+ static QcomKeys Keys;
++#if TB710FU_MENU_DIAG
++/* TB710FU menu diagnostics, written to androidboot.kshim_s1..s8 after the
++ * menu hands off (MMU off).  Read-only bookkeeping, no behaviour change. */
++static struct {
++    int keys_rc, keys_parse, mmu_cfg, mmu_en, lvgl;
++    unsigned key_count, frames;
++    uint64_t t_menu, t_first, t_last, t_keys;
++    uint32_t reads, errors;
++    QcomKeyDescriptor d[QCOM_KEYS_MAX];
++    uint32_t last[QCOM_KEYS_MAX], changes[QCOM_KEYS_MAX];
++} Tb710fuDiag = {.keys_rc = -9, .keys_parse = -9, .mmu_cfg = -9, .mmu_en = -9, .lvgl = -9};
++static int tb710fu_diag_read32_status(void *context, uint64_t address, uint32_t *value)
++{
++    int status = kshim_qcom_key_read32_status(context, address, value);
++    ++Tb710fuDiag.reads;
++    if (status) ++Tb710fuDiag.errors;
++    for (unsigned i = 0; i < Tb710fuDiag.key_count && i < QCOM_KEYS_MAX; ++i) {
++        if (Tb710fuDiag.d[i].Base + Tb710fuDiag.d[i].RegisterOffset != address) continue;
++        uint32_t v = status ? 0xeeeeeeeeu : *value;
++        if (Tb710fuDiag.reads > 1 && v != Tb710fuDiag.last[i]) ++Tb710fuDiag.changes[i];
++        Tb710fuDiag.last[i] = v;
++    }
++    return status;
++}
++static uint32_t tb710fu_diag_read32(void *context, uint64_t address)
++{
++    uint32_t v;
++    return tb710fu_diag_read32_status(context, address, &v) == 0 ? v : UINT32_MAX;
++}
++static void tb710fu_diag_report(void *fdt)
++{
++    char r[81];
++    int n;
++#define TB_SLOT(i) do { if (n > 0 && n < (int)sizeof(r)) (void)dt_probe_report_slot(fdt, (i), r); } while (0)
++    n = snprintf(r, sizeof(r), "t1:keys=%d:parse=%d:n=%u:mmucfg=%d:mmuen=%d:lvgl=%d",
++                 Tb710fuDiag.keys_rc, Tb710fuDiag.keys_parse, Tb710fuDiag.key_count,
++                 Tb710fuDiag.mmu_cfg, Tb710fuDiag.mmu_en, Tb710fuDiag.lvgl); TB_SLOT(1);
++    n = snprintf(r, sizeof(r), "t2:fr=%u:menu_ms=%llu:first_ms=%llu:last_ms=%llu:keys_ms=%llu",
++                 Tb710fuDiag.frames,
++                 (unsigned long long)Tb710fuDiag.t_menu, (unsigned long long)Tb710fuDiag.t_first,
++                 (unsigned long long)Tb710fuDiag.t_last, (unsigned long long)Tb710fuDiag.t_keys); TB_SLOT(2);
++    n = snprintf(r, sizeof(r), "t3:reads=%u:err=%u", (unsigned)Tb710fuDiag.reads,
++                 (unsigned)Tb710fuDiag.errors); TB_SLOT(3);
++    for (unsigned i = 0; i < 5; ++i) {
++        if (i < Tb710fuDiag.key_count) {
++            const QcomKeyDescriptor *k = &Tb710fuDiag.d[i];
++            n = snprintf(r, sizeof(r), "t4:%u:c=%u:a=%u:s=%u:b=%llx:o=%x:m=%x:al=%u:v=%x:ch=%u",
++                         i, (unsigned)k->Code, (unsigned)k->Action, (unsigned)k->Source,
++                         (unsigned long long)k->Base, (unsigned)k->RegisterOffset,
++                         (unsigned)k->Mask, (unsigned)k->ActiveLow,
++                         (unsigned)Tb710fuDiag.last[i], (unsigned)Tb710fuDiag.changes[i]);
++        } else {
++            n = snprintf(r, sizeof(r), "t4:%u:none", i);
++        }
++        TB_SLOT(4 + i);
++    }
++#undef TB_SLOT
++}
++#endif
+ static int build_keys(const void *fdt)
+ {
+ #if CONFIG_KSHIM_DIAGNOSTIC_UI_ONLY
+@@ -146,10 +205,20 @@
+     dt_parent_index_begin(fdt);
+     int status = QcomKeysBuildFromFdt(&adapter.Ops, descriptors, QCOM_KEYS_MAX, &count);
+     dt_parent_index_end();
++#if TB710FU_MENU_DIAG
++    Tb710fuDiag.keys_parse = status;
++    Tb710fuDiag.key_count = (unsigned)(count < QCOM_KEYS_MAX ? count : QCOM_KEYS_MAX);
++    memcpy(Tb710fuDiag.d, descriptors, Tb710fuDiag.key_count * sizeof(descriptors[0]));
++#endif
+     if (status || !count)
+         return -1;
++#if TB710FU_MENU_DIAG
++    status = QcomKeysInitEx(&Keys, descriptors, count, tb710fu_diag_read32,
++                            tb710fu_diag_read32_status, NULL);
++#else
+     status = QcomKeysInitEx(&Keys, descriptors, count, kshim_qcom_key_read32,
+                             kshim_qcom_key_read32_status, NULL);
++#endif
+     QcomKeysSetDebounce(&Keys, CONFIG_QCOM_KEY_DEBOUNCE_SAMPLES);
+     return status;
+ #else
+@@ -477,16 +546,36 @@
+     r->framebuffer = config;
+ #endif
+     if (!config.render_address || kshim_fb_init(&Framebuffer, &config)) return -1;
+-    int keys = build_keys(fdt);
++#if TB710FU_MENU_DIAG
++    uint64_t tb_t0 = get_current_time();
++#endif
+ #if CONFIG_KSHIM_SMP
+     int status = kshim_smp_init(fdt);
+     SmpInitialized = status == 0;
+     if (SmpInitialized) status = kshim_smp_start_workers(KSHIM_SMP_DEFAULT_TIMEOUT_US);
+     printf("PSCI workers: %u (status %d)\n", (unsigned)kshim_smp_available_count(), status);
+ #endif
++#if TB710FU_MENU_DIAG
++    if (!kshim_mmu_is_enabled()) {
++        Tb710fuDiag.mmu_cfg = kshim_mmu_root_table() ? 1 : kshim_mmu_configure_default(fdt);
++        if (Tb710fuDiag.mmu_cfg >= 0) (void)kshim_mmu_enable_current_cpu();
++    }
++    Tb710fuDiag.mmu_en = kshim_mmu_is_enabled();
++#else
+     if (!kshim_mmu_is_enabled() &&
+         (kshim_mmu_root_table() || kshim_mmu_configure_default(fdt) == 0))
+         (void)kshim_mmu_enable_current_cpu();
++#endif
++    /* TB710FU: parse keys after the menu MMU is on (cached DT walk); the
++     * key MMIO (SPMI) is part of the resource mappings polled later anyway. */
++#if TB710FU_MENU_DIAG
++    uint64_t tb_tk = get_current_time();
++    int keys = build_keys(fdt);
++    Tb710fuDiag.keys_rc = keys;
++    Tb710fuDiag.t_keys = get_current_time() - tb_tk;
++#else
++    int keys = build_keys(fdt);
++#endif
+     kshim_boot_metrics_record_once(KSHIM_BOOT_STAGE_MMU);
+     kshim_lvgl_set_scratch((void *)(uintptr_t)r->ui_scratch.base,
+                            (size_t)r->ui_scratch.size);
+@@ -504,6 +593,10 @@
+     QcomKeys *menu_keys = &Keys;
+ #endif
+     int lvgl_status = kshim_lvgl_init(&Lvgl, &Framebuffer, menu_keys);
++#if TB710FU_MENU_DIAG
++    Tb710fuDiag.lvgl = lvgl_status;
++    Tb710fuDiag.t_menu = get_current_time() - tb_t0;
++#endif
+ #if CONFIG_KSHIM_DIAGNOSTIC_UI_ONLY
+     UiInit = lvgl_status;
+ #endif
+@@ -538,6 +631,15 @@
+     uint64_t now = get_current_time(), elapsed = now - LastTime;
+     LastTime = now;
+     kshim_lvgl_frame(&Lvgl, elapsed > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed);
++#if TB710FU_MENU_DIAG
++    {
++        static uint64_t tb_start;
++        uint64_t t = get_current_time();
++        if (!Tb710fuDiag.frames) { tb_start = now; Tb710fuDiag.t_first = t - now; }
++        ++Tb710fuDiag.frames;
++        Tb710fuDiag.t_last = t - tb_start;
++    }
++#endif
+ #if CONFIG_KSHIM_DIAGNOSTIC_UI_ONLY
+     ++UiFrames;
+ #endif
+@@ -1835,8 +1937,16 @@
+             ui_probe_report((void *)(uintptr_t)fdt, close, *selected);
+             return close ? -2 : 0;
+ #else
++#if TB710FU_MENU_DIAG
++            {
++                int tb_close = kshim_platform_prepare_handoff();
++                tb710fu_diag_report((void *)(uintptr_t)fdt);
++                return tb_close ? -2 : 0;
++            }
++#else
+             return kshim_platform_prepare_handoff() ? -2 : 0;
+ #endif
++#endif
+         }
+     }
+ #if CONFIG_KSHIM_DIAGNOSTIC_UI_ONLY
+@@ -1847,7 +1957,10 @@
+     }
+ #else
+     if (kshim_platform_prepare_handoff()) return -2;
++#if TB710FU_MENU_DIAG
++    tb710fu_diag_report((void *)(uintptr_t)fdt);
+ #endif
++#endif
+ #if !CONFIG_KSHIM_DEBUG_CONSOLE
+     /* Approved minimal gate: the initial GUI never started on TB322FC and the
+      * caller's original initial row is the Android payload. Cleanup above has
+--- a/src/include/qcom_dt.h	2026-10-19 10:58:10
++++ b/src/include/qcom_dt.h	2026-10-19 11:00:57
+@@ -79,3 +79,9 @@
+ void kshim_splash_snapshot_capture(const struct CrSplashResources *r, const struct CrIo *io);
+ 
+ int kshim_splash_snapshot_report(const struct kshim_splash_snapshot *s, unsigned slot, char *out, size_t capacity);
++
++/* TB710FU (SM8650 "pineapple") diagnostic register dump: CTL0/CTL1, LM0/LM1
++ * and SRC_SIZE/SRC0_ADDR/SRC_YSTRIDE0/SRC_FORMAT of all 10 SSPPs, reported as
++ * 8 hex words per androidboot.kshim_s1..s8 slot. */
++int kshim_tb710fu_dump_report(unsigned slot, char *out, size_t capacity);
++int kshim_tb710fu_fb_report(char *out, size_t capacity);
+--- a/src/arch/arm64/mmu.c	2026-10-19 11:06:31
++++ b/src/arch/arm64/mmu.c	2026-10-19 11:17:19
+@@ -589,18 +589,96 @@
+ {
+     if (!mMmu.configured)
+         return 0;
++    /* TB710FU: clean+invalidate every WB region, read-only ones too (the FDT
++     * is mapped RO for the menu but edited after the MMU is off; stale clean
++     * lines would otherwise be seen by the next kernel once it enables caches). */
+     for (size_t index = 0; index < mMmu.region_count; index++) {
+-        if (mMmu.regions[index].type == KSHIM_MMU_NORMAL_WB &&
+-            (mMmu.regions[index].permissions & KSHIM_MMU_WRITE))
++        if (mMmu.regions[index].type == KSHIM_MMU_NORMAL_WB)
+             clean_range(mMmu.regions[index].base, mMmu.regions[index].size);
+     }
+ #if defined(__aarch64__)
+     __asm__ volatile("dsb sy\nic iallu\ndsb sy\nisb" ::: "memory");
+ #endif
+     disable_at_el(current_el());
++    return 0;
++}
++
++#define EARLY_DEVICE_LIMIT UINT64_C(0x1000000000)
++int kshim_mmu_early_enable(uint64_t fdt, uint64_t fdt_size)
++{
++    uint64_t lo[2], hi[2], cursor = 0;
++    kshim_mmu_region_t wb[2];
++    if (mMmu.configured || kshim_mmu_is_enabled() || !fdt || !fdt_size ||
++        fdt > UINT64_MAX - fdt_size)
++        return -1;
++    uint64_t ib = align_down((uint64_t)(uintptr_t)__image_start_address__, MMU_PAGE_SIZE);
++    uint64_t ie, fb = align_down(fdt, MMU_PAGE_SIZE), fe;
++    if (align_up((uint64_t)(uintptr_t)__image_end_address__, MMU_PAGE_SIZE, &ie) ||
++        align_up(fdt + fdt_size, MMU_PAGE_SIZE, &fe) || ie > EARLY_DEVICE_LIMIT ||
++        fe > EARLY_DEVICE_LIMIT || (fb < ie && ib < fe))
++        return -1;
++    wb[0] = (kshim_mmu_region_t){ib, ie - ib, KSHIM_MMU_NORMAL_WB,
++        KSHIM_MMU_READ | KSHIM_MMU_WRITE | KSHIM_MMU_EXECUTE};
++    wb[1] = (kshim_mmu_region_t){fb, fe - fb, KSHIM_MMU_NORMAL_WB,
++        KSHIM_MMU_READ | KSHIM_MMU_WRITE};
++    if (fb < ib) { kshim_mmu_region_t t = wb[0]; wb[0] = wb[1]; wb[1] = t; }
++    for (unsigned i = 0; i < 2; ++i) { lo[i] = wb[i].base; hi[i] = wb[i].base + wb[i].size; }
++
++    memset(&mMmu, 0, sizeof(mMmu));
++    memset(mTables, 0, sizeof(mTables));
++    mMmu.root = allocate_table();
++    if (mMmu.root == NULL)
++        return -2;
++    for (unsigned i = 0; i < 2; ++i) {
++        if (lo[i] > cursor) {
++            kshim_mmu_region_t dev = {cursor, lo[i] - cursor, KSHIM_MMU_DEVICE,
++                                      KSHIM_MMU_READ | KSHIM_MMU_WRITE};
++            if (add_region(&dev)) goto fail;
++        }
++        if (add_region(&wb[i])) goto fail;
++        cursor = hi[i];
++    }
++    if (cursor < EARLY_DEVICE_LIMIT) {
++        kshim_mmu_region_t dev = {cursor, EARLY_DEVICE_LIMIT - cursor, KSHIM_MMU_DEVICE,
++                                  KSHIM_MMU_READ | KSHIM_MMU_WRITE};
++        if (add_region(&dev)) goto fail;
++    }
++    mMmu.entry_el = current_el();
++    mMmu.configured = 1U;
++#if defined(__aarch64__)
++    clean_range((uint64_t)(uintptr_t)&mMmu, sizeof(mMmu));
++    clean_range((uint64_t)(uintptr_t)mTables, sizeof(mTables));
++    __asm__ volatile("dsb sy" ::: "memory");
++#endif
++    if (enable_at_el(mMmu.entry_el)) goto fail;
+     return 0;
++fail:
++    memset(&mMmu, 0, sizeof(mMmu));
++    return -3;
+ }
+ 
++int kshim_mmu_early_disable(void)
++{
++    if (!mMmu.configured)
++        return 0;
++    uint64_t ib = (uint64_t)(uintptr_t)__image_start_address__;
++    uint64_t ie = (uint64_t)(uintptr_t)__image_end_address__;
++    kshim_mmu_region_t keep[2];
++    size_t n = 0;
++    for (size_t i = 0; i < mMmu.region_count && n < 2; ++i)
++        if (mMmu.regions[i].type == KSHIM_MMU_NORMAL_WB) keep[n++] = mMmu.regions[i];
++    (void)kshim_mmu_prepare_handoff();
++    /* Lines allocated between the clean above and SCTLR.M/C=0 (stack, this
++     * frame) are written back and dropped here, with caches already off. */
++    for (size_t i = 0; i < n; ++i) clean_range(keep[i].base, keep[i].size);
++    clean_range(ib, ie - ib);
++#if defined(__aarch64__)
++    __asm__ volatile("dsb sy\nic iallu\ndsb sy\nisb" ::: "memory");
++#endif
++    memset(&mMmu, 0, sizeof(mMmu));
++    return 0;
++}
++
+ void kshim_mmu_cpu_off_prepare(void)
+ {
+     (void)kshim_mmu_prepare_handoff();
+--- a/src/drivers/qcom_reboot.c	2026-10-19 11:06:31
++++ b/src/drivers/qcom_reboot.c	2026-10-19 11:06:31
+@@ -51,7 +51,9 @@
+     if (fdt_node_check_compatible(fdt, 0, "qcom,canoep") &&
+         fdt_node_check_compatible(fdt, 0, "lenovo,tb323fu") &&
+         fdt_node_check_compatible(fdt, 0, "lenovo,baldur") &&
+-        fdt_node_check_compatible(fdt, 0, "qcom,sunp"))
++        fdt_node_check_compatible(fdt, 0, "qcom,sunp") &&
++        /* TB710FU (SM8650): same SCM dload + SDAM restart_reason DT ABI. */
++        fdt_node_check_compatible(fdt, 0, "qcom,pineapple"))
+         return KSHIM_QCOM_REBOOT_UNSUPPORTED;
+ 
+     int scm = unique_compatible(fdt, "qcom,scm");
+--- a/src/include/kshim_mmu.h	2026-10-19 11:06:31
++++ b/src/include/kshim_mmu.h	2026-10-19 11:06:31
+@@ -43,6 +43,14 @@
+ uint64_t kshim_mmu_entry_el(void);
+ uint64_t kshim_mmu_root_table(void);
+ int kshim_mmu_prepare_handoff(void);
++/* TB710FU: temporary identity map for the DT/resource phase (MMU-off data
++ * accesses are Device-typed and made that phase take ~19 s).  Only this
++ * runtime image and the incoming FDT become Normal WB; every other address
++ * below 64 GiB stays Device-nGnRnE exactly as with the MMU off, so nothing
++ * else is cached or speculatively fetched.  early_disable cleans/invalidates,
++ * turns the MMU off and forgets the tables so the menu builds its own map. */
++int kshim_mmu_early_enable(uint64_t fdt, uint64_t fdt_size);
++int kshim_mmu_early_disable(void);
+ void kshim_mmu_cpu_off_prepare(void);
+ 
+ /* Compatibility entry used by the existing main path. */
+--- a/src/dt/dt.c	2026-10-19 11:15:36
++++ b/src/dt/dt.c	2026-10-19 11:15:36
+@@ -307,8 +307,10 @@
+         for (int i = 0; i < len / (4 * (ac + sc)); ++i) {
+             uint64_t base, size;
+             if (dt_raw_reg(f, node, (unsigned)i, &base, &size)) return -1;
+-            /* skip unallocated firmware reserved-memory placeholders (base==size==0) */
+-            if (base == 0 && size == 0) continue;
++            /* skip unallocated firmware reserved-memory placeholders (base==size==0);
++             * TB710FU also carries size-0 nodes with a nonzero base
++             * (e.g. mpss_dsm_region@86b00000) that reserve nothing. */
++            if (size == 0) continue;
+             if (*count == capacity || dt_reg(f, node, i, &ranges[*count])) return -1;
+             no_map[(*count)++] = flag;
+         }

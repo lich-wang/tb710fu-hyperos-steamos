@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""TB710FU: real DRM off/on cycle for the DSI panel (cold-boot latch race).
+
+The NT36532 dual-DSI panel occasionally fails to latch its first enable after a
+cold boot: backlight on, no picture.  Under X11 the fix was `xrandr --output
+DSI-1 --off; xrandr --output DSI-1 --auto` which re-runs the whole panel enable
+sequence.  Under KWin/Wayland the same is impossible from userspace (KWin
+refuses to disable the only output), so do it at the DRM level *before* the
+display manager starts, when the device is free.
+
+This uses libdrm through ctypes (no compiler on the board): save the CRTC state
+(framebuffer + mode) the kernel's fbdev console left behind, then
+    SetCrtc(fb=0)          -> panel disable sequence
+    SetCrtc(saved fb, mode) -> panel enable sequence
+three times.  Failures are logged, never fatal.
+"""
+
+import ctypes
+import os
+import sys
+import time
+
+# tb710fu: DRM card that carries the DSI connector (msm-kms), from $TB_CARD
+CARD = os.environ.get("TB_CARD", "/dev/dri/card1")
+
+LOG = "/run/tb-panel-cycle.log"
+
+
+def log(msg):
+    line = "%s %s\n" % (time.strftime("%H:%M:%S"), msg)
+    try:
+        with open(LOG, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+    sys.stdout.write(line)
+
+
+class drmModeModeInfo(ctypes.Structure):
+    _fields_ = [
+        ("clock", ctypes.c_uint32),
+        ("hdisplay", ctypes.c_uint16), ("hsync_start", ctypes.c_uint16),
+        ("hsync_end", ctypes.c_uint16), ("htotal", ctypes.c_uint16),
+        ("hskew", ctypes.c_uint16),
+        ("vdisplay", ctypes.c_uint16), ("vsync_start", ctypes.c_uint16),
+        ("vsync_end", ctypes.c_uint16), ("vtotal", ctypes.c_uint16),
+        ("vscan", ctypes.c_uint16),
+        ("vrefresh", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("type", ctypes.c_uint32),
+        ("name", ctypes.c_char * 32),
+    ]
+
+
+class drmModeCrtc(ctypes.Structure):
+    _fields_ = [
+        ("crtc_id", ctypes.c_uint32),
+        ("buffer_id", ctypes.c_uint32),
+        ("x", ctypes.c_uint32), ("y", ctypes.c_uint32),
+        ("width", ctypes.c_uint32), ("height", ctypes.c_uint32),
+        ("mode_valid", ctypes.c_int),
+        ("mode", drmModeModeInfo),
+        ("gamma_size", ctypes.c_int),
+    ]
+
+
+class drmModeRes(ctypes.Structure):
+    _fields_ = [
+        ("count_fbs", ctypes.c_int), ("fbs", ctypes.POINTER(ctypes.c_uint32)),
+        ("count_crtcs", ctypes.c_int), ("crtcs", ctypes.POINTER(ctypes.c_uint32)),
+        ("count_connectors", ctypes.c_int),
+        ("connectors", ctypes.POINTER(ctypes.c_uint32)),
+        ("count_encoders", ctypes.c_int),
+        ("encoders", ctypes.POINTER(ctypes.c_uint32)),
+        ("min_width", ctypes.c_uint32), ("max_width", ctypes.c_uint32),
+        ("min_height", ctypes.c_uint32), ("max_height", ctypes.c_uint32),
+    ]
+
+
+class drmModeConnector(ctypes.Structure):
+    _fields_ = [
+        ("connector_id", ctypes.c_uint32),
+        ("encoder_id", ctypes.c_uint32),
+        ("connector_type", ctypes.c_uint32),
+        ("connector_type_id", ctypes.c_uint32),
+        ("connection", ctypes.c_uint32),
+        ("mmWidth", ctypes.c_uint32), ("mmHeight", ctypes.c_uint32),
+        ("subpixel", ctypes.c_uint32),
+        ("count_modes", ctypes.c_int),
+        ("modes", ctypes.POINTER(drmModeModeInfo)),
+        ("count_props", ctypes.c_int),
+        ("props", ctypes.POINTER(ctypes.c_uint32)),
+        ("prop_values", ctypes.POINTER(ctypes.c_uint64)),
+        ("count_encoders", ctypes.c_int),
+        ("encoders", ctypes.POINTER(ctypes.c_uint32)),
+    ]
+
+
+class drmModeEncoder(ctypes.Structure):
+    _fields_ = [
+        ("encoder_id", ctypes.c_uint32),
+        ("encoder_type", ctypes.c_uint32),
+        ("crtc_id", ctypes.c_uint32),
+        ("possible_crtcs", ctypes.c_uint32),
+        ("possible_clones", ctypes.c_uint32),
+    ]
+
+
+def main():
+    cycles = 3
+    info_only = False
+    for arg in sys.argv[1:]:
+        if arg == "info":
+            info_only = True
+        else:
+            cycles = int(arg)
+    try:
+        libdrm = ctypes.CDLL("libdrm.so.2")
+    except OSError as exc:
+        log("no libdrm: %s" % exc)
+        return 0
+
+    libdrm.drmModeGetResources.restype = ctypes.POINTER(drmModeRes)
+    libdrm.drmModeGetConnector.restype = ctypes.POINTER(drmModeConnector)
+    libdrm.drmModeGetCrtc.restype = ctypes.POINTER(drmModeCrtc)
+    libdrm.drmModeGetEncoder.restype = ctypes.POINTER(drmModeEncoder)
+    libdrm.drmModeSetCrtc.argtypes = [
+        ctypes.c_int, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.c_int,
+        ctypes.POINTER(drmModeModeInfo),
+    ]
+
+    # the DRM node can register late on this board (deferred probe)
+    for _ in range(40):
+        if os.path.exists(CARD):
+            break
+        time.sleep(0.5)
+    try:
+        fd = os.open(CARD, os.O_RDWR)
+    except OSError as exc:
+        log("open " + CARD + " failed: %s" % exc)
+        return 0
+
+    if not info_only and libdrm.drmSetMaster(fd) != 0:
+        log("drmSetMaster failed - another master holds the device; skipping")
+        os.close(fd)
+        return 0
+
+    res = libdrm.drmModeGetResources(fd)
+    if not res:
+        log("drmModeGetResources failed")
+        os.close(fd)
+        return 0
+
+    conn_id = None
+    for i in range(res.contents.count_connectors):
+        cid = res.contents.connectors[i]
+        conn = libdrm.drmModeGetConnector(fd, cid)
+        if not conn:
+            continue
+        # prefer the connected DSI connector (DRM_MODE_CONNECTOR_DSI == 18)
+        if conn.contents.connection == 1:
+            log("connector %d type=%d connected" % (cid, conn.contents.connector_type))
+            conn_id = cid
+            enc_id = conn.contents.encoder_id
+            break
+        libdrm.drmModeFreeConnector(conn)
+    if conn_id is None:
+        log("no connected connector found")
+        os.close(fd)
+        return 0
+
+    enc = libdrm.drmModeGetEncoder(fd, enc_id)
+    if not enc or enc.contents.crtc_id == 0:
+        log("no crtc bound to encoder %d" % enc_id)
+        os.close(fd)
+        return 0
+    crtc_id = enc.contents.crtc_id
+
+    crtc = libdrm.drmModeGetCrtc(fd, crtc_id)
+    if not crtc or crtc.contents.mode_valid == 0 or crtc.contents.buffer_id == 0:
+        log("crtc %d has no saved state; nothing to restore (fbdev not up?)" % crtc_id)
+        os.close(fd)
+        return 0
+    fb_id = crtc.contents.buffer_id
+    mode = crtc.contents.mode
+    log("conn=%d crtc=%d fb=%d mode=%s %dx%d@%d valid=%d gamma=%d" % (
+        conn_id, crtc_id, fb_id, mode.name.decode(errors="replace"),
+        mode.hdisplay, mode.vdisplay, mode.vrefresh, crtc.contents.mode_valid,
+        crtc.contents.gamma_size))
+    if info_only:
+        os.close(fd)
+        return 0
+    log("cycle start: %d cycles" % cycles)
+
+    conns = (ctypes.c_uint32 * 1)(conn_id)
+    for n in range(cycles):
+        r = libdrm.drmModeSetCrtc(fd, crtc_id, 0, 0, 0, None, 0, None)
+        log("  cycle %d: disable rc=%d" % (n + 1, r))
+        time.sleep(1)
+        r = libdrm.drmModeSetCrtc(fd, crtc_id, fb_id, 0, 0, conns, 1,
+                                  ctypes.byref(mode))
+        log("  cycle %d: enable  rc=%d" % (n + 1, r))
+        time.sleep(1)
+
+    libdrm.drmDropMaster(fd)
+    os.close(fd)
+    log("cycle done")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

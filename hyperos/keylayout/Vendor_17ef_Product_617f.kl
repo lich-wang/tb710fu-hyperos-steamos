@@ -1,0 +1,6 @@
+# Lenovo Tab Pen Plus (BLE, VID 0x17EF PID 0x617F) - Consumer Control button
+# The pen reports click patterns as vendor consumer usages (kernel: KEY_UNKNOWN).
+key usage 0x000c0600   BACK                  # single click  -> back (no notes-role app for STYLUS_BUTTON_TAIL)
+key usage 0x000c0601   SYSRQ                 # double click  -> screenshot
+key usage 0x000c0602   HOME                  # triple click  -> home
+key usage 0x000c0603   APP_SWITCH            # long press    -> recent apps

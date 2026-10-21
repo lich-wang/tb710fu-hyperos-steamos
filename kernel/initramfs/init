@@ -1,0 +1,52 @@
+#!/bin/busybox sh
+# TB710FU kShimC Linux initramfs.
+# Root = ext4 (label tb710fu-root) at byte offset 10 GiB of the "super" partition
+# (Android's logical partitions end at 9.70 GiB). Falls back to /diag.sh.
+/bin/busybox --install -s /bin
+mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev 2>/dev/null
+mkdir -p /dev/pts /tmp /run /newroot; mount -t devpts devpts /dev/pts; mount -t configfs none /sys/kernel/config
+echo "===== TB710FU Linux (kShimC) $(uname -r) ====="
+grep -q tb710fu.diag /proc/cmdline && exec sh /diag.sh
+# SteamOS installed on UFS: GPT partition "steamos" (sda15, carved from the end of
+# userdata on 10/20), ext4 label steamos-root. Tried first; NBD (Mac) is the fallback.
+STEAM=""; n=0
+while [ $n -lt 15 ]; do
+  for b in /sys/class/block/sd*; do grep -q "^PARTNAME=steamos$" $b/uevent 2>/dev/null && STEAM=/dev/$(basename $b); done
+  [ -n "$STEAM" ] && [ -b "$STEAM" ] && break; sleep 1; n=$((n+1))
+done
+if [ -n "$STEAM" ] && mount -t ext4 -o rw,noatime $STEAM /newroot 2>/dev/null; then
+  if [ -x /newroot/sbin/init ] || [ -L /newroot/sbin/init ]; then
+    echo "root = $STEAM (steamos partition), switching"
+    umount /sys/kernel/config /dev/pts 2>/dev/null
+    mount --move /dev /newroot/dev; mount --move /proc /newroot/proc; mount --move /sys /newroot/sys
+    exec switch_root /newroot /sbin/init
+  fi
+  umount /newroot
+fi
+# SteamOS root on a disk image served by the Mac over USB NCM (NBD), cmdline tb710fu.nbd
+if grep -q tb710fu.nbd /proc/cmdline; then
+  sh /nbdroot.sh && {
+    umount /sys/kernel/config /dev/pts 2>/dev/null
+    mount --move /dev /newroot/dev; mount --move /proc /newroot/proc; mount --move /sys /newroot/sys
+    exec switch_root /newroot /sbin/init
+  }
+  echo "!! NBD root failed -> diagnostic shell"; exec sh /diag.sh
+fi
+SUPER=""; n=0
+while [ $n -lt 30 ]; do
+  for b in /sys/class/block/sd*; do grep -q "^PARTNAME=super$" $b/uevent 2>/dev/null && SUPER=/dev/$(basename $b); done
+  [ -n "$SUPER" ] && [ -b "$SUPER" ] && break; sleep 1; n=$((n+1))
+done
+echo "super = $SUPER (after ${n}s)"
+OFF=10737418240
+if [ -n "$SUPER" ] && losetup -o $OFF /dev/loop0 $SUPER && \
+   [ "$(dd if=/dev/loop0 bs=1 skip=1144 count=16 2>/dev/null | tr -d '\000')" = "tb710fu-root" ] && \
+   mount -t ext4 -o rw,noatime /dev/loop0 /newroot && [ -x /newroot/sbin/init ]; then
+  echo "root ok, switching"
+  umount /sys/kernel/config /dev/pts 2>/dev/null
+  mount --move /dev /newroot/dev; mount --move /proc /newroot/proc; mount --move /sys /newroot/sys
+  exec switch_root /newroot /sbin/init
+fi
+echo "!! root fs not usable -> diagnostic shell"
+umount /newroot 2>/dev/null; losetup -d /dev/loop0 2>/dev/null
+exec sh /diag.sh

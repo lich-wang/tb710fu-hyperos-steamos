@@ -1,0 +1,11 @@
+--- a/usr/lib/steamos/gamescope-session
++++ b/usr/lib/steamos/gamescope-session
+@@ -344,7 +344,7 @@
+   --steam
+   --xwayland-count 2
+   --adaptive-sync
+-  --default-touch-mode 4
++  --default-touch-mode "$(cat "$HOME/.config/tb710fu/touch-mode" 2>/dev/null || echo 1)"   # tb710fu: saved by tb-touch-mode, default 1 = left click
+   --hide-cursor-delay 3000
+   --framerate-limit 0
+   --max-scale 2

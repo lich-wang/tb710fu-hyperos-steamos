@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <public type="array" name="config_tether_ncm_regexs" id="0x7f010000" />
+</resources>

@@ -1,0 +1,17 @@
+#!/bin/bash
+# TB710FU: per-focus touchscreen mode for gamescope.
+# Click mode (1) makes Proton games clickable but kills swipe-scrolling in Steam's own UI,
+# native mode (4) is the other way round. Follow GAMESCOPE_FOCUSED_APP on Steam's Xwayland:
+#   Steam UI (appid 769) or nothing focused -> 4 (native touch, swipes work)
+#   any game                                -> mode saved by tb-touch-mode (default 1)
+export DISPLAY=:0
+CONF="$HOME/.config/tb710fu/touch-mode"
+apply() {
+  local app=$1 m  # set on every focus change: tb-touch-mode may have changed the atom meanwhile
+  if [ -z "$app" ] || [ "$app" = 0 ] || [ "$app" = 769 ]; then m=4; else m=$(cat "$CONF" 2>/dev/null || echo 1); fi
+  xprop -root -f STEAM_TOUCH_CLICK_MODE 32c -set STEAM_TOUCH_CLICK_MODE "$m"
+}
+until xprop -root >/dev/null 2>&1; do sleep 2; done
+xprop -root -spy GAMESCOPE_FOCUSED_APP | while read -r line; do
+  apply "$(sed -n 's/.*= *\([0-9]*\).*/\1/p' <<<"$line")"
+done
