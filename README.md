@@ -45,6 +45,7 @@ ABL（未解锁，信任 AOSP testkey）
 
 | 文档 | 内容 |
 |---|---|
+| [docs/flash-guide.md](docs/flash-guide.md) | **刷机指南**：从官方系统到双系统的完整步骤 |
 | [docs/boot-chain.md](docs/boot-chain.md) | 锁 BL 启动原理、AVB/防回滚、EDL 备份与线刷、救砖（900E） |
 | [docs/hyperos4.md](docs/hyperos4.md) | HyperOS 4 移植：底包选择、改动清单、构建与刷入、排错记录 |
 | [docs/dualboot-kshim.md](docs/dualboot-kshim.md) | kShimC 开机菜单：打包签名、SM8650 屏幕读取、MMU 提速、系统切换 |
@@ -56,28 +57,36 @@ ABL（未解锁，信任 AOSP testkey）
 ## 仓库结构
 
 ```
-tools/          构建与刷机工具：build_os4.py（HyperOS 4 分区构建）、make_super.py、erofs_meta.py、
-                kshim_pack_boot.py / kshim_variants.sh（打包双系统 boot）、flash_super.sh、mac/（切换与远程工具）
+tools/          构建与刷机工具：make_v3_bootchain.py（v3 启动链）、build_os4.py（HyperOS 4 分区构建）、make_super.py、
+                lp_unpack.py、erofs_meta.py、kshim_pack_boot.py / kshim_variants.sh（打包双系统 boot）、flash_super.sh、
+                collect_firmware.sh、patch_tplg.py、mac/（切换与远程工具）
 kshim/          kShimC 的 TB710FU 补丁、defconfig、构建脚本
 kernel/         Linux 7.2.6 内核：总补丁（基于 armadaos-freedom）、.config、initramfs、可复现构建脚本 build.sh
 steamos/        SteamOS 安装脚本、rootfs 叠加文件（服务/配置）、gamescope 补丁、Steam 辅助工具
 hyperos/        HyperOS 侧：笔按键映射、SELinux 兼容策略、RRO overlay 源码、Magisk 模块
 docker/         构建容器（内核、kShimC、NBD 服务器）
 extras/         Mac 无线副屏色彩测量脚本
-docs/           文档
+docs/           文档（刷机指南见 flash-guide.md）
+AGENT.md        给 AI Agent 的刷机操作规程
 work/           （不入库）你自己设备的备份、底包、构建产物
 ```
 
-## 快速开始（概要）
+## 怎么刷
 
-完整步骤见各文档，这里只列顺序：
+完整步骤：**[docs/flash-guide.md](docs/flash-guide.md)**——从联想官方 ZUI 1.5.04.495 开始，进 9008 备份，
+线刷 HyperOS 3 移植包，换 v3 启动链，root，编译内核与开机菜单，SteamOS 先网络试跑再装进 UFS，最后刷入 HyperOS 4。
 
-1. **备份**：进 9008，用 [edl](https://github.com/bkerler/edl) 备份 GPT、全部唯一数据分区、A 槽启动链（[boot-chain.md](docs/boot-chain.md)）。
-2. **HyperOS**：先让设备能正常进入 HyperOS 3 移植包（v3 启动链），再用 `tools/build_os4.py` + `tools/make_super.py` 构建 HyperOS 4 的 super 并刷入（[hyperos4.md](docs/hyperos4.md)）。
-3. **内核**：`kernel/build.sh` 在 docker 里编译内核、DTB、模块（[linux-kernel.md](docs/linux-kernel.md)）。
-4. **开机菜单**：编译 kShimC，`tools/kshim_variants.sh` 打包并签名两个 boot 变体，root 下写入 `boot_a`（[dualboot-kshim.md](docs/dualboot-kshim.md)）。
-5. **SteamOS**：先用 Mac 上的 NBD 网络根盘试跑，再切分区装到 UFS，最后运行 `steamos/install_payload.sh`（[steamos.md](docs/steamos.md)）。
-6. 之后用 `tools/mac/tbboot android|linux` 在两个系统之间切换。
+> **推荐用 AI Agent 来刷**：让一个能执行命令的 AI 编程 Agent 读取 [`AGENT.md`](AGENT.md)（操作规程：安全红线、
+> 每次写入前的确认、各阶段检查点、已知故障）和刷机指南，由它执行命令、校验结果，需要你动手时它会停下来告诉你。
+
+步骤概要：
+
+1. 9008 备份 GPT 和所有分区（尤其唯一数据分区）。
+2. `edl qfil` 线刷 HyperOS 3 移植包 → `tools/make_v3_bootchain.py` 生成 v3 启动链并写入 A 槽（输出与指南里的 sha256 逐字节一致）。
+3. Magisk root → `tools/collect_firmware.sh` 收集本机固件。
+4. `kernel/build.sh` 编译内核 → 编译 kShimC → `tools/kshim_variants.sh` 打包双系统 boot 写入 boot_a。
+5. Mac 上 NBD 网络根盘试跑 SteamOS → `steamos/steamos_install_ufs.sh` 装进 UFS。
+6. `tools/build_os4.py` + `tools/make_super.py` 构建 HyperOS 4 super → `tools/flash_super.sh` 刷入。
 
 ## 致谢与上游
 

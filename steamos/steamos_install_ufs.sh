@@ -6,7 +6,7 @@
 #     (factory-reset state). BACK UP userdata/metadata FIRST if you need anything on them.
 #  Sector numbers are for the 256 GB model (sda14 userdata = 5105064..61390842); check yours.
 #  3. ext4 "steamos-root" on sda15, copy / and /home of the running system into it.
-#  4. fstab: root by label, /home is a directory of root; USB NCM services for ssh.
+#  4. fstab: root by label, /home is a directory of root.
 set -euo pipefail
 D=/dev/sda
 [ "$(blockdev --getss $D)" = 4096 ] || { echo "unexpected sector size"; exit 1; }
@@ -47,10 +47,7 @@ cat $F
 mkdir -p /mnt/steamos/etc/systemd/system/multi-user.target.wants
 ln -sf /dev/null /mnt/steamos/etc/systemd/system/home.mount
 ln -sf /dev/null /mnt/steamos/etc/systemd/system/steamos-sm8550-expand-home.service
-install -m755 /tmp/tb-usb-ncm /tmp/tb-usb-ncm-watch /mnt/steamos/usr/local/sbin/
-install -m644 /tmp/tb-usb-ncm.service /tmp/tb-usb-ncm-watch.service /mnt/steamos/etc/systemd/system/
-ln -sf /etc/systemd/system/tb-usb-ncm.service /mnt/steamos/etc/systemd/system/multi-user.target.wants/
-ln -sf /etc/systemd/system/tb-usb-ncm-watch.service /mnt/steamos/etc/systemd/system/multi-user.target.wants/
+# USB NCM (ssh over the cable) and the other TB710FU services come with install_payload.sh
 rm -f /mnt/steamos/etc/sudoers.d/90-tb710fu-test
 sync; df -h /mnt/steamos; umount /mnt/steamos
 echo INSTALL-OK

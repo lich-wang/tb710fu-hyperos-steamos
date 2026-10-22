@@ -4,6 +4,8 @@
 #   MODULES_TAR   modules-7.2.6-tb710fu.tar from kernel/build.sh
 #   FIRMWARE_DIR  a tree laid out like /usr/lib/firmware with this device's firmware
 #                 (see docs/firmware.md; none of it can be redistributed)
+# Optional: SSH_PUBKEY=~/.ssh/id_ed25519.pub -> key login for root and steamos, sshd enabled
+#           (needed for the UFS install step, which runs over ssh on the NBD-booted system)
 # Where:
 #   on the tablet, in SteamOS, as root:   install_payload.sh ...
 #   into a mounted image (offline):       ROOT=/mnt/root install_payload.sh ...  (arm64 host or container)
@@ -36,6 +38,16 @@ mkdir -p $E/etc/systemd/user/gamescope-session.target.wants
 for u in tb-touch-auto tb-touch-gestures; do
   ln -sfn /etc/systemd/user/$u.service $E/etc/systemd/user/gamescope-session.target.wants/$u.service
 done
+if [ -n "${SSH_PUBKEY:-}" ]; then
+  echo "== ssh keys + sshd"
+  for h in "$ROOT/root" "$ROOT/home/steamos"; do
+    [ -d "$h" ] || continue
+    mkdir -p "$h/.ssh"; cat "$SSH_PUBKEY" >> "$h/.ssh/authorized_keys"; chmod 700 "$h/.ssh"; chmod 600 "$h/.ssh/authorized_keys"
+  done
+  U=$(awk -F: '$1=="steamos"{print $3":"$4}' "$ROOT/etc/passwd" 2>/dev/null || true)
+  [ -n "$U" ] && chown -R "$U" "$ROOT/home/steamos/.ssh"
+  ln -sfn /usr/lib/systemd/system/sshd.service $S/multi-user.target.wants/sshd.service
+fi
 echo "== pen hwdb"
 systemd-hwdb update --usr --root="$ROOT"
 echo "== gamescope touch mode"
