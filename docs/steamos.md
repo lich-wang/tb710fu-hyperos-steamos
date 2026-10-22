@@ -96,6 +96,13 @@ gamescope 自带的触摸模式只有"触摸 = 某一个鼠标键"（1 左、2 �
 
 `qcom_battmgr` 读数正常。到 80% 显示"未充电"，是 Steam 设置里的充电上限（SteamOS 写入 `charge_control_end_threshold`），可在设置里改。
 
+## 睡眠
+
+内核默认选 `deep`（固件声明了 PSCI SYSTEM_SUSPEND）。10/21 实测深度睡眠前两次能唤醒，第三次一直没醒，只能长按电源强制重启。
+SM8650 掌机内核（ArmadaOS 的 s2idle 补丁系列、SteamOS-ARM-Port）都是围绕 s2idle 做的，所以用
+`/etc/systemd/sleep.conf.d/tb710fu-s2idle.conf`（`MemorySleepMode=s2idle`，放在底层 /etc）固定为 s2idle：睡眠与电源键唤醒实测正常。
+唤醒时触摸芯片的固件可能要重试两三次才能加载成功（日志里的 `nvt_check_fw_reset_state failed` 属于这种情况），最终能恢复。
+
 ## 游戏兼容（ARM64）
 
 运行方式：
