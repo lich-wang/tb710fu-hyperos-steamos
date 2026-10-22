@@ -14,6 +14,8 @@ with the mouse (Unity, raw input) only react to real relative motion:
   two fingers  tap = right click, move together = right drag (rotate the camera),
                pinch = mouse wheel (zoom)
   pen          hover = move, tip = left, tip with side button = right, second button = middle
+  three-finger tap = Steam menu (Shift+Tab, the STEAM button), four-finger tap = quick access
+               menu (Shift+Ctrl+Tab, the ... button) -- also in Steam's own UI
 
 Steam's own UI keeps native touch (swipe scrolling); the pen is turned into a one-finger
 touchscreen there (gamescope ignores tablet tools). Runs as the session user.
@@ -37,6 +39,7 @@ EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
 ABS_X, ABS_Y = 0, 1
 EV_REL, REL_X, REL_Y, REL_WHEEL, REL_WHEEL_HI_RES = 2, 0, 1, 8, 11
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+KEY_TAB, KEY_LEFTCTRL, KEY_LEFTSHIFT = 15, 29, 42
 ABS_MT_SLOT, ABS_MT_X, ABS_MT_Y, ABS_MT_ID = 0x2f, 0x35, 0x36, 0x39
 BTN_TOUCH, BTN_STYLUS, BTN_STYLUS2, BTN_TOOL_PEN = 0x14a, 0x14b, 0x14c, 0x140
 EVIOCGRAB = 0x40044590
@@ -229,6 +232,59 @@ class PenTouch:
         self.is_down = down
 
 
+class Keys:
+    """Virtual keyboard for Steam's own hotkeys (Guide = Shift+Tab, QAM = Shift+Ctrl+Tab)."""
+
+    def __init__(self):
+        u = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(u, 0x40045564, EV_KEY)
+        for k in (KEY_TAB, KEY_LEFTCTRL, KEY_LEFTSHIFT):
+            fcntl.ioctl(u, 0x40045565, k)
+        fcntl.ioctl(u, 0x405c5503, struct.pack("HHHH80sI", 0x03, 0x17ef, 0x6181, 1, b"TB710FU touch hotkeys", 0))
+        fcntl.ioctl(u, 0x5501)
+        self.u = u
+
+    def chord(self, keys):
+        for k in keys:
+            os.write(self.u, EV.pack(0, 0, EV_KEY, k, 1) + EV.pack(0, 0, EV_SYN, 0, 0))
+            time.sleep(0.03)
+        for k in reversed(keys):
+            os.write(self.u, EV.pack(0, 0, EV_KEY, k, 0) + EV.pack(0, 0, EV_SYN, 0, 0))
+            time.sleep(0.03)
+
+
+class MultiTap:
+    """3/4-finger taps, seen on every touch frame whether or not the touchscreen is grabbed."""
+    MAX_TIME, MAX_MOVE = 0.6, 60
+
+    def __init__(self, keys):
+        self.keys, self.t0, self.maxn, self.start, self.moved = keys, None, 0, {}, False
+
+    def frame(self, contacts):              # contacts: {slot: (x, y)}
+        n = len(contacts)
+        if DEBUG and n != getattr(self, '_last_n', -1):
+            dbg('contacts', n)
+            self._last_n = n
+        if n and self.t0 is None:
+            self.t0, self.maxn, self.start, self.moved = time.monotonic(), 0, {}, False
+        if self.t0 is None:
+            return
+        self.maxn = max(self.maxn, n)
+        for k, p in contacts.items():
+            p0 = self.start.setdefault(k, p)
+            if dist(p, p0) > self.MAX_MOVE:
+                self.moved = True
+        if n == 0:
+            quick = time.monotonic() - self.t0 < self.MAX_TIME and not self.moved
+            if quick and self.maxn == 3:
+                log("three-finger tap: Steam menu")
+                self.keys.chord([KEY_LEFTSHIFT, KEY_TAB])
+            elif quick and self.maxn == 4:
+                log("four-finger tap: quick access menu")
+                self.keys.chord([KEY_LEFTSHIFT, KEY_LEFTCTRL, KEY_TAB])
+            self.t0 = None
+
+
 # ---------------------------------------------------------------- gestures
 def dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
@@ -251,6 +307,11 @@ class Gestures:
         """pts: list of (x, y) in panel pixels, current contacts in slot order."""
         g, n, now = self.g, len(pts), time.monotonic()
         if g is None:
+            return
+        if n >= 3:                                       # three/four fingers: MultiTap's business
+            if self.state != self.WAIT:
+                g.release_all()
+                self.state = self.WAIT
             return
         s = self.state
         if s == self.IDLE:
@@ -405,6 +466,7 @@ def main():
     touch, pen = Dev(TOUCH_NAME), Dev(PEN_NAME)
     pentouch = PenTouch()
     mouse = Mouse()
+    mtap = MultiTap(Keys())
     gest = Gestures()
     slots, cur = {}, 0
     pstate = {"x": 0, "y": 0, "prox": False, "tip": False, "b1": False, "b2": False}
@@ -414,7 +476,11 @@ def main():
         now = time.monotonic()
         if now - last_poll > 0.3:
             last_poll = now
-            touch.ensure()
+            if touch.fd is None and touch.ensure():
+                # a new device starts in slot 0 and the kernel drops an ABS_MT_SLOT that does not
+                # change the slot: never carry the old device's current slot over
+                cur = 0
+                slots.clear()
             pen.ensure()
             pen.grab(True)
             app = ui.card("GAMESCOPE_FOCUSED_APP")
@@ -455,6 +521,10 @@ def main():
             except OSError:
                 log("lost", dev.name)
                 dev.close()
+                if dev is touch:                         # forget contacts we will never see lift
+                    slots.clear()
+                    mtap.t0 = None
+                    gest.reset()
                 continue
             for i in range(0, len(data) - EV.size + 1, EV.size):
                 _, _, t, c, v = EV.unpack_from(data, i)
@@ -468,8 +538,10 @@ def main():
                             slots[cur] = list(slots.get(cur, (0, 0)))
                     elif t == EV_ABS and c in (ABS_MT_X, ABS_MT_Y) and cur in slots:
                         slots[cur][0 if c == ABS_MT_X else 1] = v / UNIT
-                    elif t == EV_SYN and c == 0 and touch.grabbed:
-                        gest.touch_frame([tuple(slots[k]) for k in sorted(slots)])
+                    elif t == EV_SYN and c == 0:
+                        mtap.frame({k: tuple(v) for k, v in slots.items()})
+                        if touch.grabbed:
+                            gest.touch_frame([tuple(slots[k]) for k in sorted(slots)])
                 else:
                     if t == EV_ABS and c == ABS_X:
                         pstate["x"] = v

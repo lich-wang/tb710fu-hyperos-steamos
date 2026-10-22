@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mt.py CMD...  - scripted multi-touch gestures on a uinput touchscreen "tb mt test"
 coords in panel pixels (3200x2000).  Commands (run in order):
-  wait S | tap X,Y | hold X,Y,S | drag X1,Y1,X2,Y2,S | pan2 X,Y,DX,DY,S | pinch X,Y,D1,D2,S"""
+  wait S | tap X,Y | tapn X,Y,N | hold X,Y,S | drag X1,Y1,X2,Y2,S | pan2 X,Y,DX,DY,S | pinch X,Y,D1,D2,S"""
 import fcntl, os, struct, sys, time
 EV = struct.Struct("qqHHi")
 u = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
@@ -36,6 +36,7 @@ for cmd in sys.argv[1:]:
     elif op == "tap": path([(v[0], v[1])], [(v[0], v[1])], 0.06)
     elif op == "hold": path([(v[0], v[1])], [(v[0], v[1])], v[2])
     elif op == "drag": path([(v[0], v[1])], [(v[2], v[3])], v[4])
+    elif op == "tapn": pts = [(v[0] + 200 * i, v[1]) for i in range(int(v[2]))]; path(pts, pts, 0.1)
     elif op == "tap2": path([(v[0] - 150, v[1]), (v[0] + 150, v[1])], [(v[0] - 150, v[1]), (v[0] + 150, v[1])], 0.08)
     elif op == "pan2": x, y, dx, dy, d = v; path([(x - 150, y), (x + 150, y)], [(x - 150 + dx, y + dy), (x + 150 + dx, y + dy)], d)
     elif op == "pinch": x, y, d1, d2, d = v; path([(x - d1 / 2, y), (x + d1 / 2, y)], [(x - d2 / 2, y), (x + d2 / 2, y)], d)

@@ -17,12 +17,12 @@
 | 系统 | 状态 |
 |---|---|
 | **HyperOS 4**（小米平板 8 底包移植） | 日常可用：显示 3200×2000@120Hz、WiFi/蓝牙、相机、传感器、音频、小米账号、人脸解锁、Magisk root、USB 网络共享（NCM）、无线副屏 |
-| **SteamOS**（SteamOS-ARM-Port 用户空间 + 本项目内核） | 日常可用：原生 DSI 屏幕、Adreno 750 GPU（Turnip/Vulkan，903 MHz）、WiFi 7、4 扬声器立体声、触摸、手写笔、电池、USB 双角色、Steam 登录与 Proton/FEX 游戏 |
+| **SteamOS**（SteamOS-ARM-Port 用户空间 + 本项目内核） | 日常可用：原生 DSI 屏幕、Adreno 750 GPU（Turnip/Vulkan，903 MHz）、WiFi 7、4 扬声器立体声、触摸手势（右键 / 拖拽 / 旋转 / 缩放 / 三指回 Steam 菜单）、手写笔、电池、USB 双角色、Steam 登录与 Proton/FEX 游戏 |
 | **开机菜单**（kShimC） | 音量键选择、超时默认项，`tbboot android\|linux` 一键切换 |
 
 已知限制：
 - 小米"查找设备"、超级小爱专家模式依赖小米专有 TEE/安全芯片，无法使用（不要打开查找设备）。
-- SteamOS 下麦克风、耳机、摄像头未适配；手写笔按"手指"处理（无压感/悬停）。
+- SteamOS 下麦克风、耳机、摄像头未适配；手写笔在游戏里按鼠标处理（无压感）。
 - 只有一个 USB-C 口；外接 U 盘做游戏库尚未实测（见 [docs/steamos.md](docs/steamos.md)）。
 
 ## 原理一览
