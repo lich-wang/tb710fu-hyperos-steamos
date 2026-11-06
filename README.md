@@ -1,5 +1,9 @@
 # TB710FU 免解锁双系统：小米澎湃 OS 4 + SteamOS
 
+> 📦 **本仓库已归档（2026-11-06），不再维护。**
+> - 原装 ZUI → 小米澎湃 OS 4 的部分已拆到新仓库 **[lich-wang/tb710fu-hyperos](https://github.com/lich-wang/tb710fu-hyperos)**，在那里继续维护。
+> - Linux / Steam 部分改为向 [ArmadaOS Freedom](https://github.com/mydanyi/armadaos-freedom) 上游提交 TB710FU 支持，本仓库的 kShimC 双系统 + SteamOS 方案不再更新。
+
 在 **不解锁 Bootloader** 的联想小新 Pad Pro GT（TB710FU，骁龙 8 Gen 3 / SM8650）上，
 同时运行 **小米澎湃 OS 4（HyperOS 4，Android）** 和 **SteamOS（ARM64，Valve Steam Frame 同源）**，
 开机时通过菜单选择系统，也可以在任一系统里一条命令切换到另一个。
